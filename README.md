@@ -141,3 +141,7 @@ conda install -c conda-forge libstdcxx-ng libgcc-ng
 conda install -c conda-forge bear
 bear -- python setup.py build_ext --inplace
 ```
+
+## Contributors
+- Xueshen Liu 
+- Yongji Wu 
