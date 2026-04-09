@@ -1,6 +1,10 @@
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#include <cstdlib>
 #endif
+
+// Enable debug logging to trace memory allocations (uncomment for debugging)
+// #define HOOK_DEBUG
 
 #include <dlfcn.h>
 #include <cstdio>
@@ -11,6 +15,7 @@
 #include <variant>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 #include <fstream>
 #include <vector>
 #include <string_view>
@@ -65,6 +70,17 @@ enum CudaDriverAPIIndex {
     CUDA_ENTRY_cuModuleEnumerateFunctions,
     CUDA_ENTRY_cuFuncGetName,
     CUDA_ENTRY_cuFuncGetModule,
+    CUDA_ENTRY_cuMemExportToShareableHandle,
+    CUDA_ENTRY_cuMemImportFromShareableHandle,
+    CUDA_ENTRY_cuIpcGetMemHandle,
+    CUDA_ENTRY_cuIpcOpenMemHandle,
+    CUDA_ENTRY_cuIpcCloseMemHandle,
+    CUDA_ENTRY_cuLinkCreate,
+    CUDA_ENTRY_cuLinkAddData,
+    CUDA_ENTRY_cuLinkComplete,
+    CUDA_ENTRY_cuLinkDestroy,
+    CUDA_ENTRY_cuModuleGetGlobal,
+    CUDA_ENTRY_cuLibraryGetGlobal,
     CUDA_ENTRY_END
 };
 
@@ -101,6 +117,17 @@ static cuda_driver_entry_t cuda_driver_entry_table[] = {
     {nullptr, "cuModuleEnumerateFunctions"},
     {nullptr, "cuFuncGetName"},
     {nullptr, "cuFuncGetModule"},
+    {nullptr, "cuMemExportToShareableHandle"},
+    {nullptr, "cuMemImportFromShareableHandle"},
+    {nullptr, "cuIpcGetMemHandle"},
+    {nullptr, "cuIpcOpenMemHandle"},
+    {nullptr, "cuIpcCloseMemHandle"},
+    {nullptr, "cuLinkCreate"},
+    {nullptr, "cuLinkAddData"},
+    {nullptr, "cuLinkComplete"},
+    {nullptr, "cuLinkDestroy"},
+    {nullptr, "cuModuleGetGlobal_v2"},
+    {nullptr, "cuLibraryGetGlobal"},
     {nullptr, nullptr}
 };
 
@@ -134,6 +161,13 @@ enum class BinaryFormat {
     UNKNOWN
 };
 
+// Bit flags for binary metadata (stored as single integer in metadata file)
+enum BinaryFlags : uint32_t {
+    BINARY_FLAG_NONE              = 0,
+    BINARY_FLAG_NEEDS_DEVICE_LINK = 1 << 0,  // Binary needs device linking at LOAD time (segments stored separately)
+    BINARY_FLAG_REQUIRES_NVSHMEM  = 1 << 1,  // Module requires NVSHMEM initialization
+};
+
 using ModuleHandles = std::tuple<CUmodule, std::unordered_map<std::string, CUfunction>>;
 using LibraryHandles = std::tuple<CUlibrary, std::unordered_map<std::string, CUkernel>>;
 
@@ -147,6 +181,8 @@ struct BinaryMetadata {
     std::vector<void*> library_option_values;
     std::vector<std::string> entrypoint_names;
     bool used = false;
+    std::vector<std::vector<uint8_t>> linked_fatbin_segments;
+    uint32_t binary_flags = BINARY_FLAG_NONE;  // Bit flags for binary properties
 };
 
 static std::atomic<int> dumped_binary_counter{0};
@@ -215,10 +251,11 @@ static boost::unordered::concurrent_flat_map<CUdeviceptr, AllocMetadata> global_
 static boost::unordered::concurrent_flat_map<CUdeviceptr, size_t> global_carved_reserve_metadata;
 
 struct HookAllocationEvent {
-    enum class Type { Alloc, Free };
+    enum class Type { Alloc, Free, Reserve };
     Type type;
     size_t size;
     CUdeviceptr ptr;
+    size_t alignment;  // Used for Reserve events
 };
 
 static std::atomic<bool> hook_recording_enabled{false};
@@ -518,6 +555,11 @@ static void dump_fatbin_and_info(const void *data_ptr, std::string_view func_nam
     const uint8_t* binary_data = nullptr;
     size_t total_size = 0;
 
+    // For FATBINC_LINK_VERSION, we may need to concatenate multiple fatbins
+    std::vector<uint8_t> concatenated_fatbin;
+    // Store individual segments for device linking during load
+    std::vector<std::vector<uint8_t>> linked_fatbin_segments;
+
     if (format == BinaryFormat::WRAPPER) {
         const auto* wrapper = static_cast<const __fatBinC_Wrapper_t*>(data_ptr);
 
@@ -528,10 +570,48 @@ static void dump_fatbin_and_info(const void *data_ptr, std::string_view func_nam
 
         if (wrapper->version == FATBINC_VERSION) {
             binary_data = reinterpret_cast<const uint8_t*>(wrapper->data);
+            total_size = compute_fatbin_size(binary_data);
         } else if (wrapper->version == FATBINC_LINK_VERSION) {
-            if (auto** fatbin_array = static_cast<void**>(wrapper->filename_or_fatbins);
-                fatbin_array && fatbin_array[0]) {
+            // For linked fatbins, iterate through all entries in the array
+            auto** fatbin_array = static_cast<void**>(wrapper->filename_or_fatbins);
+            if (!fatbin_array || !fatbin_array[0]) {
+                fprintf(stderr, "[HOOK] FATAL ERROR: Null fatbin array in link wrapper\n");
+                abort();
+            }
+
+            // Count and concatenate all fatbin entries
+            size_t num_fatbins = 0;
+            for (void** ptr = fatbin_array; *ptr != nullptr; ptr++) {
+                num_fatbins++;
+            }
+#ifdef HOOK_DEBUG
+            fprintf(stderr, "[HOOK] DEBUG: FATBINC_LINK_VERSION wrapper has %zu fatbin entries\n", num_fatbins);
+#endif
+            if (num_fatbins == 1) {
+                // Single fatbin, use directly
                 binary_data = static_cast<const uint8_t*>(fatbin_array[0]);
+                total_size = compute_fatbin_size(binary_data);
+            } else {
+                // Multiple fatbins - store each separately for device linking during load
+                // Also concatenate for hash computation
+                for (size_t i = 0; i < num_fatbins; i++) {
+                    const uint8_t* fb_data = static_cast<const uint8_t*>(fatbin_array[i]);
+                    size_t fb_size = compute_fatbin_size(fb_data);
+#ifdef HOOK_DEBUG
+                    fprintf(stderr, "[HOOK] DEBUG:   fatbin[%zu] size: %zu bytes\n", i, fb_size);
+#endif
+                    // Store each segment separately
+                    linked_fatbin_segments.emplace_back(fb_data, fb_data + fb_size);
+                    // Also concatenate for hash
+                    concatenated_fatbin.insert(concatenated_fatbin.end(), fb_data, fb_data + fb_size);
+                }
+                // Point to the concatenated buffer for hash computation
+                binary_data = concatenated_fatbin.data();
+                total_size = concatenated_fatbin.size();
+#ifdef HOOK_DEBUG
+                fprintf(stderr, "[HOOK] DEBUG: Total size for %zu linked fatbins: %zu bytes (will use device linker)\n",
+                        num_fatbins, total_size);
+#endif
             }
         }
 
@@ -539,8 +619,6 @@ static void dump_fatbin_and_info(const void *data_ptr, std::string_view func_nam
             fprintf(stderr, "[HOOK] FATAL ERROR: Null binary data in wrapper\n");
             abort();
         }
-
-        total_size = compute_fatbin_size(binary_data);
 
     } else if (format == BinaryFormat::FATBIN) {
         binary_data = static_cast<const uint8_t*>(data_ptr);
@@ -613,6 +691,16 @@ static void dump_fatbin_and_info(const void *data_ptr, std::string_view func_nam
                 metadata.library_option_values.push_back(libraryOptionValues ? libraryOptionValues[i] : nullptr);
             }
         }
+    }
+
+    // Store linked fatbin segments if this is a device-linked library
+    if (!linked_fatbin_segments.empty()) {
+        metadata.binary_flags |= BINARY_FLAG_NEEDS_DEVICE_LINK;
+        metadata.linked_fatbin_segments = std::move(linked_fatbin_segments);
+#ifdef HOOK_DEBUG
+        fprintf(stderr, "[HOOK] DEBUG: Stored %zu fatbin segments for device linking (hash %016llx)\n",
+                metadata.linked_fatbin_segments.size(), (unsigned long long)hash);
+#endif
     }
 
     binary_hash_to_metadata.emplace(hash, std::move(metadata));
@@ -825,8 +913,79 @@ static void* string_to_library_option_value(CUlibraryOption opt, const std::stri
     }
 }
 
+// ============================================================================
+// NVSHMEM Detection - Used at SAVE time to determine if modules need NVSHMEM init
+// ============================================================================
+// Known NVSHMEM device symbols that indicate NVSHMEM usage.
+// These are internal symbols from libnvshmem_device.a that get linked into
+// any CUDA module/library that uses NVSHMEM device APIs.
+static const char* const NVSHMEM_DEVICE_SYMBOLS[] = {
+    "nvshmemi_device_state_d",
+    "nvshmemi_team_pool_d",
+    "nvshmemi_team_same_mype_node_pool_d",
+    "nvshmemi_mype_d",
+    "nvshmemi_npes_d",
+    "nvshmemi_node_mype_d",
+    "nvshmemi_node_npes_d",
+    "nvshmemi_heap_base_d",
+    nullptr  // sentinel
+};
+
+// Detect if a CUmodule requires NVSHMEM initialization by probing for NVSHMEM device symbols
+static bool detect_nvshmem_requirement_for_module(CUmodule module) {
+    typedef CUresult (*cuModuleGetGlobal_t)(CUdeviceptr*, size_t*, CUmodule, const char*);
+    auto module_get_global = (cuModuleGetGlobal_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuModuleGetGlobal);
+
+    if (!module_get_global) {
+        return false;
+    }
+
+    CUdeviceptr ptr;
+    size_t size;
+
+    for (const char* const* sym = NVSHMEM_DEVICE_SYMBOLS; *sym != nullptr; ++sym) {
+        CUresult res = module_get_global(&ptr, &size, module, *sym);
+        if (res == CUDA_SUCCESS) {
+#ifdef HOOK_DEBUG
+            fprintf(stderr, "[HOOK] DEBUG: Found NVSHMEM symbol '%s' in module (ptr=%p, size=%zu)\n",
+                    *sym, (void*)ptr, size);
+#endif
+            return true;
+        }
+    }
+
+    return false;
+}
+
+// Detect if a CUlibrary requires NVSHMEM initialization by probing for NVSHMEM device symbols
+static bool detect_nvshmem_requirement_for_library(CUlibrary library) {
+    typedef CUresult (*cuLibraryGetGlobal_t)(CUdeviceptr*, size_t*, CUlibrary, const char*);
+    auto library_get_global = (cuLibraryGetGlobal_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuLibraryGetGlobal);
+
+    if (!library_get_global) {
+        return false;
+    }
+
+    CUdeviceptr ptr;
+    size_t size;
+
+    for (const char* const* sym = NVSHMEM_DEVICE_SYMBOLS; *sym != nullptr; ++sym) {
+        CUresult res = library_get_global(&ptr, &size, library, *sym);
+        if (res == CUDA_SUCCESS) {
+#ifdef HOOK_DEBUG
+            fprintf(stderr, "[HOOK] DEBUG: Found NVSHMEM symbol '%s' in library (ptr=%p, size=%zu)\n",
+                    *sym, (void*)ptr, size);
+#endif
+            return true;
+        }
+    }
+
+    return false;
+}
+
 static void dump_module_or_library_entrypoints(std::variant<CUmodule, CUlibrary> handle, uint64_t hash) {
     std::vector<std::string> entrypoint_names;
+    bool requires_nvshmem = false;
 
     if (std::holds_alternative<CUlibrary>(handle)) {
         CUlibrary library = std::get<CUlibrary>(handle);
@@ -845,7 +1004,10 @@ static void dump_module_or_library_entrypoints(std::variant<CUmodule, CUlibrary>
             fprintf(stderr, "[HOOK] FATAL ERROR: cuLibraryGetKernelCount failed with error %d\n", res);
             abort();
         }
-
+#ifdef HOOK_DEBUG
+        fprintf(stderr, "[HOOK] DEBUG: dump_module_or_library_entrypoints for hash %016llx: kernel_count=%u\n",
+                (unsigned long long)hash, kernel_count);
+#endif
         if (kernel_count > 0) {
             std::vector<CUkernel> kernels(kernel_count);
             res = enum_func(kernels.data(), kernel_count, library);
@@ -868,6 +1030,15 @@ static void dump_module_or_library_entrypoints(std::variant<CUmodule, CUlibrary>
                 entrypoint_names.push_back(name);
             }
         }
+
+        // Detect NVSHMEM requirement at SAVE time by probing for NVSHMEM device symbols
+        requires_nvshmem = detect_nvshmem_requirement_for_library(library);
+#ifdef HOOK_DEBUG
+        if (requires_nvshmem) {
+            fprintf(stderr, "[HOOK] DEBUG: Library hash %016llx requires NVSHMEM initialization\n",
+                    (unsigned long long)hash);
+        }
+#endif
     } else {
         CUmodule module = std::get<CUmodule>(handle);
 
@@ -908,14 +1079,203 @@ static void dump_module_or_library_entrypoints(std::variant<CUmodule, CUlibrary>
                 entrypoint_names.push_back(name);
             }
         }
+
+        // Detect NVSHMEM requirement at SAVE time by probing for NVSHMEM device symbols
+        requires_nvshmem = detect_nvshmem_requirement_for_module(module);
+#ifdef HOOK_DEBUG
+        if (requires_nvshmem) {
+            fprintf(stderr, "[HOOK] DEBUG: Module hash %016llx requires NVSHMEM initialization\n",
+                    (unsigned long long)hash);
+        }
+#endif
     }
 
-    binary_hash_to_metadata.visit(hash, [&entrypoint_names](auto& pair) {
+    binary_hash_to_metadata.visit(hash, [&entrypoint_names, requires_nvshmem](auto& pair) {
         pair.second.entrypoint_names = std::move(entrypoint_names);
+        if (requires_nvshmem) {
+            pair.second.binary_flags |= BINARY_FLAG_REQUIRES_NVSHMEM;
+        }
     });
 }
 
-static void setup_handles_for_module(CUmodule module, uint64_t hash, const std::vector<std::string>& expected_names) {
+// ============================================================================
+// NVSHMEM Auto-Initialization for DeepEP Kernels
+// ============================================================================
+// When loading CUDA modules/libraries that contain DeepEP kernels (which use
+// NVSHMEM for inter-GPU communication), we need to call nvshmemx_cumodule_init
+// or nvshmemx_culibrary_init to properly link the NVSHMEM device-side state.
+// Without this, kernels will fail with IBGDA assertion errors on replay.
+// Default to false since most graphs don't use NVSHMEM; enable via set_nvshmem_auto_init(true).
+
+static std::atomic<bool> nvshmem_auto_init_enabled{false};
+
+// Track modules/libraries that need deferred NVSHMEM init.
+// This is populated during load_cuda_modules_and_libraries when nvshmem_auto_init is disabled.
+// The variant holds either CUmodule or CUlibrary.
+using NvshmemPendingHandle = std::variant<CUmodule, CUlibrary>;
+struct NvshmemPendingEntry {
+    uint64_t hash;
+    NvshmemPendingHandle handle;
+};
+static std::vector<NvshmemPendingEntry> pending_nvshmem_init;
+static std::mutex pending_nvshmem_mutex;
+
+// Initialize NVSHMEM for a loaded CUmodule
+// The requires_nvshmem flag should have been determined at SAVE time by probing for NVSHMEM symbols
+static void maybe_init_nvshmem_for_module(CUmodule module, uint64_t hash, bool requires_nvshmem) {
+    if (!requires_nvshmem) {
+        return;
+    }
+
+    // If nvshmem_auto_init is disabled, add to pending list for deferred init
+    if (!nvshmem_auto_init_enabled.load()) {
+        std::lock_guard<std::mutex> lock(pending_nvshmem_mutex);
+        pending_nvshmem_init.push_back({hash, module});
+#ifdef HOOK_DEBUG
+        fprintf(stderr, "[HOOK] DEBUG: Added module hash %016llx to pending NVSHMEM init list\n",
+                (unsigned long long)hash);
+#endif
+        return;
+    }
+
+#ifdef HOOK_DEBUG
+    fprintf(stderr, "[HOOK] DEBUG: Initializing NVSHMEM for module hash %016llx\n",
+            (unsigned long long)hash);
+#endif
+
+    using init_fn_t = int (*)(CUmodule);
+    static init_fn_t init_fn = reinterpret_cast<init_fn_t>(
+        dlsym(RTLD_DEFAULT, "nvshmemx_cumodule_init"));
+
+    if (!init_fn) {
+        fprintf(stderr, "[HOOK] WARNING: nvshmemx_cumodule_init not found; "
+                "NVSHMEM-using kernels may fail (hash %016llx). "
+                "Ensure libnvshmem_host.so is in LD_PRELOAD or LD_LIBRARY_PATH.\n",
+                (unsigned long long)hash);
+        return;
+    }
+
+    int res = init_fn(module);
+    if (res != 0) {
+        fprintf(stderr, "[HOOK] WARNING: nvshmemx_cumodule_init failed for hash %016llx (res=%d)\n",
+                (unsigned long long)hash, res);
+    }
+}
+
+// Initialize NVSHMEM for a loaded CUlibrary
+// The requires_nvshmem flag should have been determined at SAVE time by probing for NVSHMEM symbols
+static void maybe_init_nvshmem_for_library(CUlibrary library, uint64_t hash, bool requires_nvshmem) {
+    if (!requires_nvshmem) {
+        return;
+    }
+
+    // If nvshmem_auto_init is disabled, add to pending list for deferred init
+    if (!nvshmem_auto_init_enabled.load()) {
+        std::lock_guard<std::mutex> lock(pending_nvshmem_mutex);
+        pending_nvshmem_init.push_back({hash, library});
+#ifdef HOOK_DEBUG
+        fprintf(stderr, "[HOOK] DEBUG: Added library hash %016llx to pending NVSHMEM init list\n",
+                (unsigned long long)hash);
+#endif
+        return;
+    }
+
+#ifdef HOOK_DEBUG
+    fprintf(stderr, "[HOOK] DEBUG: Initializing NVSHMEM for library hash %016llx\n",
+            (unsigned long long)hash);
+#endif
+
+    using init_fn_t = int (*)(CUlibrary);
+    static init_fn_t init_fn = reinterpret_cast<init_fn_t>(
+        dlsym(RTLD_DEFAULT, "nvshmemx_culibrary_init"));
+
+    if (!init_fn) {
+        fprintf(stderr, "[HOOK] WARNING: nvshmemx_culibrary_init not found; "
+                "NVSHMEM-using kernels may fail (hash %016llx). "
+                "Ensure libnvshmem_host.so is in LD_PRELOAD or LD_LIBRARY_PATH.\n",
+                (unsigned long long)hash);
+        return;
+    }
+
+    int res = init_fn(library);
+    if (res != 0) {
+        fprintf(stderr, "[HOOK] WARNING: nvshmemx_culibrary_init failed for hash %016llx (res=%d)\n",
+                (unsigned long long)hash, res);
+    }
+}
+
+// Initialize NVSHMEM for all already-loaded modules/libraries that require it.
+// This should be called AFTER NVSHMEM runtime is initialized (e.g., by DeepEP Buffer creation).
+// Processes the pending_nvshmem_init list which is populated during load_cuda_modules_and_libraries
+// when nvshmem_auto_init is disabled.
+// Returns the number of modules/libraries initialized.
+int init_nvshmem_for_loaded_modules() {
+    using cumodule_init_fn_t = int (*)(CUmodule);
+    using culibrary_init_fn_t = int (*)(CUlibrary);
+
+    static cumodule_init_fn_t cumodule_init_fn = reinterpret_cast<cumodule_init_fn_t>(
+        dlsym(RTLD_DEFAULT, "nvshmemx_cumodule_init"));
+    static culibrary_init_fn_t culibrary_init_fn = reinterpret_cast<culibrary_init_fn_t>(
+        dlsym(RTLD_DEFAULT, "nvshmemx_culibrary_init"));
+
+    if (!cumodule_init_fn && !culibrary_init_fn) {
+        fprintf(stderr, "[HOOK] WARNING: Neither nvshmemx_cumodule_init nor nvshmemx_culibrary_init found; "
+                "NVSHMEM-using kernels may fail. "
+                "Ensure libnvshmem_host.so is in LD_PRELOAD or LD_LIBRARY_PATH.\n");
+        return 0;
+    }
+
+    // Take ownership of the pending list
+    std::vector<NvshmemPendingEntry> pending;
+    {
+        std::lock_guard<std::mutex> lock(pending_nvshmem_mutex);
+        pending = std::move(pending_nvshmem_init);
+        pending_nvshmem_init.clear();
+    }
+
+    if (pending.empty()) {
+        fprintf(stderr, "[HOOK] INFO: No modules pending NVSHMEM initialization\n");
+        return 0;
+    }
+
+    fprintf(stderr, "[HOOK] INFO: Processing %zu modules pending NVSHMEM initialization\n", pending.size());
+
+    int count = 0;
+    for (const auto& entry : pending) {
+        if (std::holds_alternative<CUlibrary>(entry.handle)) {
+            if (culibrary_init_fn) {
+                CUlibrary library = std::get<CUlibrary>(entry.handle);
+                int res = culibrary_init_fn(library);
+                if (res != 0) {
+                    fprintf(stderr, "[HOOK] WARNING: nvshmemx_culibrary_init failed for hash %016llx (res=%d)\n",
+                            (unsigned long long)entry.hash, res);
+                } else {
+                    fprintf(stderr, "[HOOK] INFO: Initialized NVSHMEM for library hash %016llx\n",
+                            (unsigned long long)entry.hash);
+                    count++;
+                }
+            }
+        } else if (std::holds_alternative<CUmodule>(entry.handle)) {
+            if (cumodule_init_fn) {
+                CUmodule module = std::get<CUmodule>(entry.handle);
+                int res = cumodule_init_fn(module);
+                if (res != 0) {
+                    fprintf(stderr, "[HOOK] WARNING: nvshmemx_cumodule_init failed for hash %016llx (res=%d)\n",
+                            (unsigned long long)entry.hash, res);
+                } else {
+                    fprintf(stderr, "[HOOK] INFO: Initialized NVSHMEM for module hash %016llx\n",
+                            (unsigned long long)entry.hash);
+                    count++;
+                }
+            }
+        }
+    }
+
+    return count;
+}
+
+static void setup_handles_for_module(CUmodule module, uint64_t hash, const std::vector<std::string>& expected_names,
+                                     bool requires_nvshmem = false) {
     typedef CUresult (*cuModuleGetFunctionCount_t)(unsigned int*, CUmodule);
     typedef CUresult (*cuModuleEnumerateFunctions_t)(CUfunction*, unsigned int, CUmodule);
     typedef CUresult (*cuFuncGetName_t)(const char**, CUfunction);
@@ -963,10 +1323,14 @@ static void setup_handles_for_module(CUmodule module, uint64_t hash, const std::
         }
     }
 
+    // Initialize NVSHMEM if required (flag determined at SAVE time via symbol probing)
+    maybe_init_nvshmem_for_module(module, hash, requires_nvshmem);
+
     binary_hash_to_handles.insert_or_assign(hash, std::make_tuple(module, func_map));
 }
 
-static void setup_handles_for_library(CUlibrary library, uint64_t hash, const std::vector<std::string>& expected_names) {
+static void setup_handles_for_library(CUlibrary library, uint64_t hash, const std::vector<std::string>& expected_names,
+                                      bool requires_nvshmem = false) {
     typedef CUresult (*cuLibraryGetKernelCount_t)(unsigned int*, CUlibrary);
     typedef CUresult (*cuLibraryEnumerateKernels_t)(CUkernel*, unsigned int, CUlibrary);
     typedef CUresult (*cuKernelGetName_t)(const char**, CUkernel);
@@ -984,6 +1348,31 @@ static void setup_handles_for_library(CUlibrary library, uint64_t hash, const st
     if (kernel_count != expected_names.size()) {
         fprintf(stderr, "[HOOK] ERROR: Kernel count mismatch for hash %016llx: got %u, expected %zu\n",
                 (unsigned long long)hash, kernel_count, expected_names.size());
+
+        // Debug: enumerate and print all kernels that ARE available
+        if (kernel_count > 0) {
+            std::vector<CUkernel> avail_kernels(kernel_count);
+            if (enum_func(avail_kernels.data(), kernel_count, library) == CUDA_SUCCESS) {
+                fprintf(stderr, "[HOOK] DEBUG: Available kernels in library:\n");
+                std::unordered_set<std::string> avail_names;
+                for (const auto& kernel : avail_kernels) {
+                    const char* name = nullptr;
+                    if (get_name_func(&name, kernel) == CUDA_SUCCESS && name) {
+                        avail_names.insert(name);
+                        fprintf(stderr, "[HOOK] DEBUG:   - %s\n", name);
+                    }
+                }
+
+                // Print missing kernels
+                fprintf(stderr, "[HOOK] DEBUG: Missing kernels (%zu):\n", expected_names.size() - avail_names.size());
+                for (const auto& expected : expected_names) {
+                    if (avail_names.find(expected) == avail_names.end()) {
+                        fprintf(stderr, "[HOOK] DEBUG:   - MISSING: %s\n", expected.c_str());
+                    }
+                }
+            }
+        }
+
         abort();
     }
 
@@ -1011,14 +1400,83 @@ static void setup_handles_for_library(CUlibrary library, uint64_t hash, const st
         }
     }
 
+    // Initialize NVSHMEM if required (flag determined at SAVE time via symbol probing)
+    maybe_init_nvshmem_for_library(library, hash, requires_nvshmem);
+
     binary_hash_to_handles.insert_or_assign(hash, std::make_tuple(library, kernel_map));
 }
 
-static void pack_fatbins_to_folder_impl(const fs::path& workspace_dir) {
-    fs::create_directories(workspace_dir);
+// Pre-link fatbin segments during SAVE mode to avoid runtime linking during LOAD
+static std::vector<uint8_t> prelink_fatbin_segments(const std::vector<std::vector<uint8_t>>& segments,
+                                                      const std::vector<CUjit_option>& jit_options,
+                                                      const std::vector<void*>& jit_option_values,
+                                                      uint64_t hash) {
+    typedef CUresult (*cuLinkCreate_t)(unsigned int, CUjit_option*, void**, CUlinkState*);
+    typedef CUresult (*cuLinkAddData_t)(CUlinkState, CUjitInputType, void*, size_t, const char*, unsigned int, CUjit_option*, void**);
+    typedef CUresult (*cuLinkComplete_t)(CUlinkState, void**, size_t*);
+    typedef CUresult (*cuLinkDestroy_t)(CUlinkState);
 
-    const fs::path packed_img_path = workspace_dir / "fatbin_image_packed.img";
-    const fs::path packed_txt_path = workspace_dir / "fatbin_entrypoint_packed.txt";
+    auto link_create = (cuLinkCreate_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuLinkCreate);
+    auto link_add_data = (cuLinkAddData_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuLinkAddData);
+    auto link_complete = (cuLinkComplete_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuLinkComplete);
+    auto link_destroy = (cuLinkDestroy_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuLinkDestroy);
+
+    if (!link_create || !link_add_data || !link_complete || !link_destroy) {
+        fprintf(stderr, "[HOOK] WARNING: CUDA linker API not available, cannot pre-link\n");
+        return {};
+    }
+
+    unsigned int num_jit = jit_options.size();
+    CUjit_option* jit_opts = num_jit > 0 ? const_cast<CUjit_option*>(jit_options.data()) : nullptr;
+    void** jit_vals = num_jit > 0 ? const_cast<void**>(jit_option_values.data()) : nullptr;
+
+    CUlinkState link_state;
+    CUresult res = link_create(num_jit, jit_opts, jit_vals, &link_state);
+    if (res != CUDA_SUCCESS) {
+        fprintf(stderr, "[HOOK] WARNING: cuLinkCreate failed with error %d during pre-link, falling back to segments\n", res);
+        return {};
+    }
+
+    // Add each segment to the linker
+    for (size_t i = 0; i < segments.size(); i++) {
+        const auto& segment = segments[i];
+        res = link_add_data(link_state, CU_JIT_INPUT_FATBINARY,
+                           const_cast<uint8_t*>(segment.data()), segment.size(),
+                           nullptr, 0, nullptr, nullptr);
+        if (res != CUDA_SUCCESS) {
+            fprintf(stderr, "[HOOK] WARNING: cuLinkAddData failed for segment %zu with error %d during pre-link\n", i, res);
+            link_destroy(link_state);
+            return {};
+        }
+    }
+
+    // Complete linking
+    void* cubin_out = nullptr;
+    size_t cubin_size = 0;
+    res = link_complete(link_state, &cubin_out, &cubin_size);
+    if (res != CUDA_SUCCESS || !cubin_out || cubin_size == 0) {
+        fprintf(stderr, "[HOOK] WARNING: cuLinkComplete failed with error %d during pre-link\n", res);
+        link_destroy(link_state);
+        return {};
+    }
+
+    // Copy the linked cubin (the linker state owns the memory, so we must copy before destroying)
+    std::vector<uint8_t> linked_cubin(static_cast<uint8_t*>(cubin_out),
+                                       static_cast<uint8_t*>(cubin_out) + cubin_size);
+
+    link_destroy(link_state);
+
+    fprintf(stderr, "[HOOK] DEBUG: Pre-linked %zu segments into %zu byte cubin for hash %016llx\n",
+            segments.size(), cubin_size, (unsigned long long)hash);
+
+    return linked_cubin;
+}
+
+static void pack_fatbins_to_folder_impl(const fs::path& archive_dir) {
+    fs::create_directories(archive_dir);
+
+    const fs::path packed_img_path = archive_dir / "fatbin_image_packed.img";
+    const fs::path packed_txt_path = archive_dir / "fatbin_entrypoint_packed.txt";
 
     std::ofstream packed_img(packed_img_path.string(), std::ios::binary);
     std::ofstream packed_txt(packed_txt_path.string());
@@ -1035,11 +1493,57 @@ static void pack_fatbins_to_folder_impl(const fs::path& workspace_dir) {
             return;
         }
 
-        const size_t size = metadata.binary_data.size();
+        // Write binary data to img file
         packed_img.write(reinterpret_cast<const char*>(&hash), sizeof(uint64_t));
-        packed_img.write(reinterpret_cast<const char*>(&size), sizeof(size_t));
-        packed_img.write(reinterpret_cast<const char*>(metadata.binary_data.data()), size);
 
+        // Compute final binary_flags for this binary
+        uint32_t binary_flags = metadata.binary_flags;
+        std::vector<uint8_t> linked_cubin;
+        bool has_segments = (binary_flags & BINARY_FLAG_NEEDS_DEVICE_LINK) && !metadata.linked_fatbin_segments.empty();
+
+        if (has_segments) {
+            // Try to pre-link the segments to avoid runtime linking during LOAD
+            linked_cubin = prelink_fatbin_segments(metadata.linked_fatbin_segments,
+                                                   metadata.jit_options,
+                                                   metadata.jit_option_values,
+                                                   hash);
+            if (!linked_cubin.empty()) {
+                // Pre-linking succeeded - clear NEEDS_DEVICE_LINK, will be stored as normal binary
+                binary_flags &= ~BINARY_FLAG_NEEDS_DEVICE_LINK;
+                has_segments = false;
+            }
+        }
+
+        if (!linked_cubin.empty()) {
+            // Write pre-linked cubin (stored same as normal binary)
+            const size_t size = linked_cubin.size();
+            packed_img.write(reinterpret_cast<const char*>(&size), sizeof(size_t));
+            packed_img.write(reinterpret_cast<const char*>(linked_cubin.data()), size);
+            fprintf(stderr, "[HOOK] DEBUG: Packed pre-linked cubin (%zu bytes) for hash %016llx\n",
+                    size, (unsigned long long)hash);
+        } else if (has_segments) {
+            // Fallback: Write marker for device-linked binary (size = 0, followed by segment count)
+            const size_t marker = 0;
+            const size_t num_segments = metadata.linked_fatbin_segments.size();
+            packed_img.write(reinterpret_cast<const char*>(&marker), sizeof(size_t));
+            packed_img.write(reinterpret_cast<const char*>(&num_segments), sizeof(size_t));
+
+            // Write each segment
+            for (const auto& segment : metadata.linked_fatbin_segments) {
+                const size_t seg_size = segment.size();
+                packed_img.write(reinterpret_cast<const char*>(&seg_size), sizeof(size_t));
+                packed_img.write(reinterpret_cast<const char*>(segment.data()), seg_size);
+            }
+            fprintf(stderr, "[HOOK] DEBUG: Packed %zu linked fatbin segments for hash %016llx (pre-link failed)\n",
+                    num_segments, (unsigned long long)hash);
+        } else {
+            // Regular single binary
+            const size_t size = metadata.binary_data.size();
+            packed_img.write(reinterpret_cast<const char*>(&size), sizeof(size_t));
+            packed_img.write(reinterpret_cast<const char*>(metadata.binary_data.data()), size);
+        }
+
+        // Write metadata to txt file
         packed_txt << str(boost::format("%016llx") % hash) << "\n";
         packed_txt << metadata.base_func_name;
 
@@ -1063,6 +1567,12 @@ static void pack_fatbins_to_folder_impl(const fs::path& workspace_dir) {
             }
         }
 
+        // Write binary_flags and num_segments if needed
+        packed_txt << ",binary_flags=" << binary_flags;
+        if (has_segments) {
+            packed_txt << ",num_segments=" << metadata.linked_fatbin_segments.size();
+        }
+
         packed_txt << "\n";
         packed_txt << metadata.entrypoint_names.size() << "\n";
         for (const auto& name : metadata.entrypoint_names) {
@@ -1076,7 +1586,7 @@ static void pack_fatbins_on_exit() {
     if (!pack_fatbins_on_exit_enabled.load()) {
         return;
     }
-    pack_fatbins_to_folder_impl(fs::path("hook_workspace"));
+    pack_fatbins_to_folder_impl(fs::path("hook_archive"));
 }
 
 static void* get_real_dlsym() {
@@ -1160,6 +1670,14 @@ static void load_cuda_library() {
     for (int i = 0; cuda_driver_entry_table[i].name != nullptr; i++) {
         cuda_driver_entry_table[i].fn_ptr = try_load_symbol(handle, cuda_driver_entry_table[i].name);
         if (!cuda_driver_entry_table[i].fn_ptr) {
+            // cuLibraryGetGlobal is optional (CUDA 12.0+), don't abort if not found
+            if (i == CUDA_ENTRY_cuLibraryGetGlobal) {
+#ifdef HOOK_DEBUG
+                fprintf(stderr, "[HOOK] DEBUG: Optional symbol %s not found (may require CUDA 12.0+)\n",
+                        cuda_driver_entry_table[i].name);
+#endif
+                continue;
+            }
             fprintf(stderr, "[HOOK] FATAL ERROR: Failed to load symbol %s\n", cuda_driver_entry_table[i].name);
             abort();
         }
@@ -1170,6 +1688,16 @@ static void load_cuda_library() {
 
 static void __attribute__((constructor)) init_hook() {
     load_cuda_library();
+
+    // Check for CGE_MODE environment variable to enable early skip of fatbin processing
+    // This allows skipping fatbin processing before Python code can call set_skip_fatbin_processing()
+    const char* cge_mode = std::getenv("CGE_MODE");
+    if (cge_mode && std::strcmp(cge_mode, "load") == 0) {
+        skip_fatbin_processing.store(true);
+#ifdef HOOK_DEBUG
+        fprintf(stderr, "[HOOK] CGE_MODE=load detected, skipping fatbin processing\n");
+#endif
+    }
 }
 
 static void __attribute__((destructor)) cleanup_hook() {
@@ -1524,6 +2052,12 @@ static void* find_symbol_by_cuda_version(const char* symbol, int cudaVersion) {
         return (void*)cuMemAddressReserve;
     } else if (strcmp(symbol, "cuMemAddressFree") == 0) {
         return (void*)cuMemAddressFree;
+    } else if (strcmp(symbol, "cuIpcGetMemHandle") == 0) {
+        return (void*)cuIpcGetMemHandle;
+    } else if (strcmp(symbol, "cuIpcOpenMemHandle") == 0) {
+        return (void*)cuIpcOpenMemHandle;
+    } else if (strcmp(symbol, "cuIpcCloseMemHandle") == 0) {
+        return (void*)cuIpcCloseMemHandle;
     }
 
     return nullptr;
@@ -1623,6 +2157,33 @@ CUresult cuMemAlloc_v2(CUdeviceptr* dptr, size_t bytesize) {
     }
 
     // Slow path: normal VMM allocation
+
+    // Idempotent check: if this address was already allocated (e.g. from replay
+    // of comm buffer events), skip physical allocation and reuse existing mapping.
+    {
+        bool already_allocated = false;
+        global_alloc_metadata.visit(target_addr, [&](const auto&) {
+            already_allocated = true;
+        });
+        if (already_allocated) {
+            *dptr = target_addr;
+            tls_storage.current_alloc_base_addr = align_to(*dptr + bytesize, kAllocAlignment);
+
+            if (hook_recording_enabled.load()) {
+                std::lock_guard<std::mutex> lock(hook_events_mutex);
+                HookAllocationEvent event;
+                event.type = HookAllocationEvent::Type::Alloc;
+                event.size = bytesize;
+                event.ptr = *dptr;
+                hook_alloc_events.push_back(event);
+            }
+
+            fprintf(stderr, "[HOOK] cuMemAlloc_v2 (IDEMPOTENT) reusing pre-mapped 0x%llx size=%zu\n",
+                    (unsigned long long)target_addr, bytesize);
+            return CUDA_SUCCESS;
+        }
+    }
+
     typedef CUresult (*cuMemCreate_t)(CUmemGenericAllocationHandle*, size_t, const CUmemAllocationProp*, unsigned long long);
     auto mem_create_func = (cuMemCreate_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuMemCreate);
 
@@ -1637,6 +2198,8 @@ CUresult cuMemAlloc_v2(CUdeviceptr* dptr, size_t bytesize) {
     prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
     prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
     prop.location.id = device;
+    // Enable IPC via VMM shareable handles (POSIX file descriptor on Linux)
+    prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
 
     CUresult result = mem_create_func(&allocHandle, aligned_size, &prop, 0);
     if (result != CUDA_SUCCESS) {
@@ -1646,7 +2209,15 @@ CUresult cuMemAlloc_v2(CUdeviceptr* dptr, size_t bytesize) {
 
     result = mem_map_func(target_addr, aligned_size, 0, allocHandle, 0);
     if (result != CUDA_SUCCESS) {
-        fprintf(stderr, "[HOOK] ERROR: cuMemMap failed with error %d at cuMemAlloc_v2\n", result);
+        fprintf(stderr, "[HOOK] ERROR: cuMemMap failed with error %d at cuMemAlloc_v2 "
+                "addr=0x%llx size=%zu (requested=%zu) alloc_base=0x%llx has_prealloc=%d "
+                "prealloc_start=0x%llx prealloc_end=0x%llx\n",
+                result,
+                (unsigned long long)target_addr, aligned_size, bytesize,
+                (unsigned long long)tls_storage.current_alloc_base_addr,
+                (int)tls_storage.has_preallocation,
+                (unsigned long long)tls_storage.preallocated_start_addr,
+                (unsigned long long)tls_storage.preallocated_end_addr);
         typedef CUresult (*cuMemRelease_t)(CUmemGenericAllocationHandle);
         auto mem_release_func = (cuMemRelease_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuMemRelease);
         mem_release_func(allocHandle);
@@ -1967,6 +2538,16 @@ CUresult cuMemAddressReserve(CUdeviceptr* ptr, size_t size, size_t alignment, CU
 
         global_carved_reserve_metadata.emplace(*ptr, size);
 
+        if (hook_recording_enabled.load()) {
+            std::lock_guard<std::mutex> lock(hook_events_mutex);
+            HookAllocationEvent event;
+            event.type = HookAllocationEvent::Type::Reserve;
+            event.size = size;
+            event.ptr = *ptr;
+            event.alignment = alignment;
+            hook_alloc_events.push_back(event);
+        }
+
 #ifdef HOOK_DEBUG
         fprintf(stderr, "[HOOK] cuMemAddressReserve ptr=0x%llx size=0x%zx alignment=0x%zx (carved from reserved region), next_alloc_base=0x%llx\n",
                 (unsigned long long)*ptr, size, alignment, (unsigned long long)tls_storage.current_alloc_base_addr);
@@ -1974,6 +2555,7 @@ CUresult cuMemAddressReserve(CUdeviceptr* ptr, size_t size, size_t alignment, CU
         return CUDA_SUCCESS;
     }
 
+    // constexpr size_t kReserveAlignment = 2ULL << 37; // FIXME(liuxs): This value should be equal to the first reservation size 
     CUdeviceptr hint_addr = align_to(tls_storage.current_vmm_reserve_addr, alignment);
     CUresult result = real_func(ptr, size, alignment, hint_addr, flags);
     if (result != CUDA_SUCCESS) {
@@ -1987,7 +2569,7 @@ CUresult cuMemAddressReserve(CUdeviceptr* ptr, size_t size, size_t alignment, CU
                 (unsigned long long)tls_storage.current_vmm_reserve_addr);
     }
 
-    tls_storage.current_vmm_reserve_addr = align_to(*ptr + size, kAllocAlignment);
+    tls_storage.current_vmm_reserve_addr = align_to(*ptr + size, alignment);
 
 #ifdef HOOK_DEBUG
     fprintf(stderr, "[HOOK] cuMemAddressReserve ptr=0x%llx size=0x%zx alignment=0x%zx (large alloc, VMM hint), next_vmm_reserve=0x%llx\n",
@@ -2065,10 +2647,222 @@ void* dlsym(void* handle, const char* symbol) {
             return (void*)cuMemAddressReserve;
         } else if (strcmp(symbol, "cuMemAddressFree") == 0) {
             return (void*)cuMemAddressFree;
+        } else if (strcmp(symbol, "cuIpcGetMemHandle") == 0) {
+            return (void*)cuIpcGetMemHandle;
+        } else if (strcmp(symbol, "cuIpcOpenMemHandle") == 0) {
+            return (void*)cuIpcOpenMemHandle;
+        } else if (strcmp(symbol, "cuIpcCloseMemHandle") == 0) {
+            return (void*)cuIpcCloseMemHandle;
         }
     }
 
     return real_dlsym(handle, symbol);
+}
+
+// =============================================================================
+// VMM IPC Support - Hook cuIpcGetMemHandle/cuIpcOpenMemHandle to work with
+// VMM allocations by translating to cuMemExportToShareableHandle API
+// =============================================================================
+
+// Magic marker to identify VMM IPC handles in CUipcMemHandle
+static constexpr uint32_t VMM_IPC_MAGIC = 0x564D4D49; // "VMMI"
+
+// Hook for cuIpcGetMemHandle - intercept Driver API to support VMM allocations
+CUresult cuIpcGetMemHandle(CUipcMemHandle* pHandle, CUdeviceptr dptr) {
+    typedef CUresult (*cuIpcGetMemHandle_t)(CUipcMemHandle*, CUdeviceptr);
+    auto real_func = (cuIpcGetMemHandle_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuIpcGetMemHandle);
+
+    // Try to find this pointer in our VMM allocations
+    AllocMetadata metadata;
+    bool found = false;
+
+    global_alloc_metadata.visit(dptr, [&](const std::pair<const CUdeviceptr, AllocMetadata>& kv) {
+        found = true;
+        metadata = kv.second;
+    });
+
+    if (found && metadata.handle != 0) {
+        // This is a VMM allocation - export via shareable handle
+        typedef CUresult (*cuMemExportToShareableHandle_t)(void*, CUmemGenericAllocationHandle, CUmemAllocationHandleType, unsigned long long);
+        auto export_func = (cuMemExportToShareableHandle_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuMemExportToShareableHandle);
+
+        if (export_func == nullptr) {
+            fprintf(stderr, "[HOOK] ERROR: cuMemExportToShareableHandle not found\n");
+            return CUDA_ERROR_NOT_SUPPORTED;
+        }
+
+        int fd = -1;
+        CUresult result = export_func(&fd, metadata.handle, CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR, 0);
+
+        if (result != CUDA_SUCCESS) {
+            fprintf(stderr, "[HOOK] ERROR: cuMemExportToShareableHandle failed with error %d for ptr=0x%llx\n",
+                    result, (unsigned long long)dptr);
+            return result;
+        }
+
+        // Pack our custom data into the handle structure
+        // CUipcMemHandle has 64 reserved bytes - we use them to store our info:
+        // - Magic marker (4 bytes) to identify VMM handles
+        // - File descriptor (4 bytes)
+        // - Original pointer address (8 bytes) - critical for CUDA graph replay!
+        // - Size (8 bytes)
+        memset(pHandle, 0, sizeof(CUipcMemHandle));
+
+        memcpy(pHandle->reserved, &VMM_IPC_MAGIC, sizeof(uint32_t));
+        memcpy(pHandle->reserved + 4, &fd, sizeof(int));
+        memcpy(pHandle->reserved + 8, &dptr, sizeof(CUdeviceptr));
+        memcpy(pHandle->reserved + 16, &metadata.size, sizeof(size_t));
+
+#ifdef HOOK_DEBUG
+        fprintf(stderr, "[HOOK] cuIpcGetMemHandle: VMM ptr=0x%llx, fd=%d, size=%zu\n",
+                (unsigned long long)dptr, fd, metadata.size);
+#endif
+        return CUDA_SUCCESS;
+    }
+
+    // Not a VMM allocation - fall back to real function
+    if (real_func) {
+        return real_func(pHandle, dptr);
+    }
+    return CUDA_ERROR_NOT_SUPPORTED;
+}
+
+// Hook for cuIpcOpenMemHandle - import VMM shareable handle and map to original address
+CUresult cuIpcOpenMemHandle(CUdeviceptr* pdptr, CUipcMemHandle handle, unsigned int Flags) {
+    typedef CUresult (*cuIpcOpenMemHandle_t)(CUdeviceptr*, CUipcMemHandle, unsigned int);
+    auto real_func = (cuIpcOpenMemHandle_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuIpcOpenMemHandle);
+
+    // Check for our VMM magic marker
+    uint32_t magic;
+    memcpy(&magic, handle.reserved, sizeof(uint32_t));
+
+    if (magic == VMM_IPC_MAGIC) {
+        // This is a VMM IPC handle - extract the packed data
+        int fd;
+        CUdeviceptr original_ptr;
+        size_t size;
+
+        memcpy(&fd, handle.reserved + 4, sizeof(int));
+        memcpy(&original_ptr, handle.reserved + 8, sizeof(CUdeviceptr));
+        memcpy(&size, handle.reserved + 16, sizeof(size_t));
+
+#ifdef HOOK_DEBUG
+        fprintf(stderr, "[HOOK] cuIpcOpenMemHandle: VMM fd=%d, original_ptr=0x%llx, size=%zu\n",
+                fd, (unsigned long long)original_ptr, size);
+#endif
+
+        // Import the allocation handle from file descriptor
+        typedef CUresult (*cuMemImportFromShareableHandle_t)(CUmemGenericAllocationHandle*, void*, CUmemAllocationHandleType);
+        auto import_func = (cuMemImportFromShareableHandle_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuMemImportFromShareableHandle);
+
+        if (import_func == nullptr) {
+            fprintf(stderr, "[HOOK] ERROR: cuMemImportFromShareableHandle not found\n");
+            return CUDA_ERROR_NOT_SUPPORTED;
+        }
+
+        CUmemGenericAllocationHandle imported_handle;
+        CUresult result = import_func(&imported_handle, (void*)(intptr_t)fd, CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR);
+
+        if (result != CUDA_SUCCESS) {
+            fprintf(stderr, "[HOOK] ERROR: cuMemImportFromShareableHandle failed with error %d\n", result);
+            return result;
+        }
+
+        // Map to the SAME address as original (critical for CUDA graph replay!)
+        typedef CUresult (*cuMemMap_t)(CUdeviceptr, size_t, size_t, CUmemGenericAllocationHandle, unsigned long long);
+        auto map_func = (cuMemMap_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuMemMap);
+
+        result = map_func(original_ptr, size, 0, imported_handle, 0);
+        if (result != CUDA_SUCCESS) {
+            fprintf(stderr, "[HOOK] ERROR: cuMemMap for IPC failed with error %d at addr=0x%llx size=%zu\n",
+                    result, (unsigned long long)original_ptr, size);
+            return result;
+        }
+
+        // Set access permissions
+        CUdevice device;
+        typedef CUresult (*cuCtxGetDevice_t)(CUdevice*);
+        auto get_device_func = (cuCtxGetDevice_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuCtxGetDevice);
+        get_device_func(&device);
+
+        CUmemAccessDesc accessDesc = {};
+        accessDesc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        accessDesc.location.id = device;
+        accessDesc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+
+        typedef CUresult (*cuMemSetAccess_t)(CUdeviceptr, size_t, const CUmemAccessDesc*, size_t);
+        auto set_access_func = (cuMemSetAccess_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuMemSetAccess);
+
+        result = set_access_func(original_ptr, size, &accessDesc, 1);
+        if (result != CUDA_SUCCESS) {
+            fprintf(stderr, "[HOOK] ERROR: cuMemSetAccess for IPC failed with error %d\n", result);
+            return result;
+        }
+
+        *pdptr = original_ptr;
+
+        // Track this imported allocation
+        AllocMetadata alloc_metadata;
+        alloc_metadata.ptr = original_ptr;
+        alloc_metadata.size = size;
+        alloc_metadata.handle = imported_handle;
+        alloc_metadata.region_base = 0;  // region_base == 0 indicates IPC-imported
+        alloc_metadata.from_preallocation = false;
+        global_alloc_metadata.emplace(original_ptr, alloc_metadata);
+
+#ifdef HOOK_DEBUG
+        fprintf(stderr, "[HOOK] cuIpcOpenMemHandle: Successfully mapped VMM fd=%d -> ptr=0x%llx, size=%zu\n",
+                fd, (unsigned long long)*pdptr, size);
+#endif
+        return CUDA_SUCCESS;
+    }
+
+    // Not a VMM IPC handle - fall back to real function
+    if (real_func) {
+        return real_func(pdptr, handle, Flags);
+    }
+    return CUDA_ERROR_NOT_SUPPORTED;
+}
+
+// Hook for cuIpcCloseMemHandle - clean up VMM IPC mappings
+CUresult cuIpcCloseMemHandle(CUdeviceptr dptr) {
+    typedef CUresult (*cuIpcCloseMemHandle_t)(CUdeviceptr);
+    auto real_func = (cuIpcCloseMemHandle_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuIpcCloseMemHandle);
+
+    AllocMetadata metadata;
+    bool found = false;
+
+    global_alloc_metadata.visit(dptr, [&](const std::pair<const CUdeviceptr, AllocMetadata>& kv) {
+        found = true;
+        metadata = kv.second;
+    });
+
+    if (found && metadata.handle != 0 && metadata.region_base == 0) {
+        // This is an IPC-imported VMM allocation (region_base == 0 indicates imported)
+        typedef CUresult (*cuMemUnmap_t)(CUdeviceptr, size_t);
+        auto mem_unmap_func = (cuMemUnmap_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuMemUnmap);
+
+        typedef CUresult (*cuMemRelease_t)(CUmemGenericAllocationHandle);
+        auto mem_release_func = (cuMemRelease_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuMemRelease);
+
+        mem_unmap_func(dptr, metadata.size);
+        mem_release_func(metadata.handle);
+
+        global_alloc_metadata.erase_if([dptr](const std::pair<const CUdeviceptr, AllocMetadata>& kv) {
+            return kv.first == dptr;
+        });
+
+#ifdef HOOK_DEBUG
+        fprintf(stderr, "[HOOK] cuIpcCloseMemHandle: Closed VMM IPC ptr=0x%llx\n", (unsigned long long)dptr);
+#endif
+        return CUDA_SUCCESS;
+    }
+
+    // Not a VMM IPC allocation - fall back to real function
+    if (real_func) {
+        return real_func(dptr);
+    }
+    return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 }
@@ -2184,6 +2978,8 @@ bool preallocate_region(size_t size) {
     prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
     prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
     prop.location.id = device;
+    // Enable IPC via VMM shareable handles (POSIX file descriptor on Linux)
+    prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
 
     CUresult result = mem_create_func(&allocHandle, aligned_size, &prop, 0);
     if (result != CUDA_SUCCESS) {
@@ -2238,12 +3034,8 @@ bool preallocate_region(size_t size) {
     tls_storage.preallocated_end_addr = target_addr + aligned_size;
     tls_storage.has_preallocation = true;
 
-    // Note: we do NOT advance current_alloc_base_addr here
-    // The alloc calls will advance it as they consume the preallocated memory
-
-    fprintf(stderr, "[HOOK] Preallocated region: addr=0x%llx - 0x%llx size=%zu (%.2f MB)\n",
-            (unsigned long long)target_addr, (unsigned long long)tls_storage.preallocated_end_addr, aligned_size, aligned_size / (1024.0 * 1024.0));
-
+    // Note: we do NOT advance current_alloc_base_addr here.
+    // The alloc calls will advance it as they consume the preallocated memory.
     return true;
 }
 
@@ -2262,9 +3054,6 @@ void free_preallocated_region() {
 
     mem_unmap_func(tls_storage.preallocated_start_addr, preallocated_size);
     mem_release_func(tls_storage.preallocated_handle);
-
-    fprintf(stderr, "[HOOK] Freed preallocated region: addr=0x%llx size=%zu\n",
-            (unsigned long long)tls_storage.preallocated_start_addr, preallocated_size);
 
     tls_storage.preallocated_handle = 0;
     tls_storage.preallocated_start_addr = 0;
@@ -2306,8 +3095,11 @@ void set_current_alloc_offset(size_t offset) {
     }
 
     tls_storage.current_alloc_base_addr = new_alloc_addr;
-    // Also update VMM reserve address to match
-    tls_storage.current_vmm_reserve_addr = new_alloc_addr;
+    // NOTE: Do NOT update current_vmm_reserve_addr here.
+    // current_alloc_base_addr tracks the cursor WITHIN the CGE region.
+    // current_vmm_reserve_addr tracks where the NEXT cuMemAddressReserve
+    // (outside the region) should hint — it was set to base + region_size
+    // by set_allocation_region and must stay there.
 
 #ifdef HOOK_DEBUG
     fprintf(stderr, "[HOOK] Set allocation offset: 0x%llx (absolute addr: 0x%llx)\n",
@@ -2344,6 +3136,11 @@ boost::json::object save_hook_events_to_json() {
         } else if (event.type == HookAllocationEvent::Type::Free) {
             event_obj["type"] = "free";
             event_obj["ptr"] = static_cast<uint64_t>(event.ptr);
+        } else if (event.type == HookAllocationEvent::Type::Reserve) {
+            event_obj["type"] = "reserve";
+            event_obj["size"] = event.size;
+            event_obj["ptr"] = static_cast<uint64_t>(event.ptr);
+            event_obj["alignment"] = event.alignment;
         }
         events_array.push_back(event_obj);
     }
@@ -2359,7 +3156,24 @@ void replay_hook_events_from_json(const boost::json::object& events_obj) {
 
     if (events_obj.contains("start_base_addr")) {
         uint64_t start_base_addr = events_obj.at("start_base_addr").to_number<uint64_t>();
-        tls_storage.current_alloc_base_addr = static_cast<CUdeviceptr>(start_base_addr);
+        if (start_base_addr >= tls_storage.current_alloc_base_addr) {
+            tls_storage.current_alloc_base_addr = static_cast<CUdeviceptr>(start_base_addr);
+        } else {
+            // LOAD mode consumed more memory than SAVE mode before graph loading.
+            // This means allocations happened in a different order or additional allocations
+            // occurred that weren't present during SAVE.
+            fprintf(stderr, "[HOOK] ERROR: Memory offset mismatch during replay\n");
+            fprintf(stderr, "[HOOK]   Current offset: 0x%llx (%.2f MB from base)\n",
+                (unsigned long long)tls_storage.current_alloc_base_addr,
+                (tls_storage.current_alloc_base_addr - (size_t)tls_storage.region.base) / (1024.0 * 1024.0));
+            fprintf(stderr, "[HOOK]   Expected start: 0x%llx (%.2f MB from base)\n",
+                (unsigned long long)start_base_addr,
+                (start_base_addr - (size_t)tls_storage.region.base) / (1024.0 * 1024.0));
+            fprintf(stderr, "[HOOK]   Difference: %.2f MB\n",
+                (tls_storage.current_alloc_base_addr - start_base_addr) / (1024.0 * 1024.0));
+            fprintf(stderr, "[HOOK] HINT: Ensure LOAD mode has identical initialization as SAVE mode\n");
+            abort();
+        }
     }
 
     const json::array& events_array = events_obj.at("events").as_array();
@@ -2393,9 +3207,33 @@ void replay_hook_events_from_json(const boost::json::object& events_obj) {
                 fprintf(stderr, "[REPLAY] HINT: Try a different base_addr in your TOML config\n");
                 abort();
             }
-
+#ifdef HOOK_DEBUG
             fprintf(stderr, "[REPLAY] OK: Allocated %zu bytes at expected address 0x%llx\n",
                     size, (unsigned long long)actual_ptr);
+#endif
+
+        } else if (type == "reserve") {
+            // Just advance the pointer without physical mapping.
+            // NVSHMEM will do its own cuMemCreate+cuMemMap when prepare_comm_buffer runs later.
+            size_t size = event_obj.at("size").to_number<uint64_t>();
+            size_t alignment = event_obj.at("alignment").to_number<uint64_t>();
+            uint64_t expected_ptr = event_obj.at("ptr").to_number<uint64_t>();
+
+            CUdeviceptr aligned_addr = align_to(tls_storage.current_alloc_base_addr, alignment);
+
+            if (aligned_addr != expected_ptr) {
+                fprintf(stderr, "[REPLAY] FATAL: Reserve address mismatch!\n");
+                fprintf(stderr, "[REPLAY]   Expected: 0x%llx\n", (unsigned long long)expected_ptr);
+                fprintf(stderr, "[REPLAY]   Actual:   0x%llx\n", (unsigned long long)aligned_addr);
+                abort();
+            }
+
+            tls_storage.current_alloc_base_addr = align_to(aligned_addr + size, kAllocAlignment);
+
+#ifdef HOOK_DEBUG
+            fprintf(stderr, "[REPLAY] OK: Reserved %zu bytes at 0x%llx (pointer advance only)\n",
+                    size, (unsigned long long)aligned_addr);
+#endif
 
         } else if (type == "free") {
             uint64_t ptr = event_obj.at("ptr").to_number<uint64_t>();
@@ -2414,9 +3252,14 @@ void set_pack_fatbins_on_exit(bool enabled) {
 
 void set_skip_fatbin_processing(bool enabled) {
     skip_fatbin_processing.store(enabled);
-    if (enabled) {
-        fprintf(stderr, "[HOOK] Fatbin processing skipped (LOAD mode optimization)\n");
-    }
+}
+
+void set_nvshmem_auto_init(bool enabled) {
+    nvshmem_auto_init_enabled.store(enabled);
+}
+
+int init_nvshmem_for_loaded_modules() {
+    return ::init_nvshmem_for_loaded_modules();
 }
 
 void pack_fatbins_to_folder(const std::string& folder_path) {
@@ -2490,6 +3333,8 @@ struct ParsedOptions {
     std::vector<void*> jit_option_values;
     std::vector<CUlibraryOption> library_options;
     std::vector<void*> library_option_values;
+    uint32_t binary_flags = BINARY_FLAG_NONE;  // Bit flags (NEEDS_DEVICE_LINK, REQUIRES_NVSHMEM)
+    size_t num_segments = 0;
 };
 
 static ParsedOptions parse_function_and_options(const std::string& func_line) {
@@ -2525,6 +3370,10 @@ static ParsedOptions parse_function_and_options(const std::string& func_line) {
             if (key == "numJitOptions" || key == "numLibraryOptions") {
             } else if (key == "filename") {
                 result.filename = value;
+            } else if (key == "binary_flags") {
+                result.binary_flags = static_cast<uint32_t>(std::stoul(value));
+            } else if (key == "num_segments") {
+                result.num_segments = std::stoul(value);
             } else if (key.find("CU_JIT_") == 0) {
                 CUjit_option opt = string_to_jit_option(key);
                 if (!is_jit_option_ignored(opt)) {
@@ -2586,12 +3435,13 @@ static ParsedOptions parse_function_and_options(const std::string& func_line) {
     return result;
 }
 
-void load_cuda_modules_and_libraries(const std::string& workspace_dir) {
+void load_cuda_modules_and_libraries(const std::string& archive_dir) {
     if (binary_loaded.load()) {
         fprintf(stderr, "[HOOK] ERROR: Binaries already loaded\n");
         abort();
     }
 
+    // FIXME: this will reset memory region, try to avoid that
     // Ensure CUDA context exists before loading modules
     typedef CUresult (*cuCtxGetCurrent_t)(CUcontext*);
     auto ctx_get_current = (cuCtxGetCurrent_t)real_dlsym(RTLD_NEXT, "cuCtxGetCurrent");
@@ -2600,23 +3450,72 @@ void load_cuda_modules_and_libraries(const std::string& workspace_dir) {
         ctx_get_current(&ctx);
     }
     if (!ctx) {
-        typedef CUresult (*cuCtxCreate_t)(CUcontext*, unsigned int, CUdevice);
-        auto ctx_create = (cuCtxCreate_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuCtxCreate_v2);
-        if (ctx_create) {
-            CUresult res = ctx_create(&ctx, 0, 0);
-            if (res != CUDA_SUCCESS) {
-                fprintf(stderr, "[HOOK] ERROR: Failed to create CUDA context, error=%d\n", res);
-                abort();
+        // Get current device from CUDA runtime (set by PyTorch/framework)
+        // cudaError_t is an enum, cudaSuccess = 0
+        typedef int (*cudaGetDevice_t)(int*);
+        auto get_device = (cudaGetDevice_t)real_dlsym(RTLD_NEXT, "cudaGetDevice");
+        int device = 0;
+        if (get_device) {
+            int err = get_device(&device);
+            if (err != 0) {  // cudaSuccess = 0
+                fprintf(stderr, "[HOOK] WARNING: cudaGetDevice failed with error %d, defaulting to device 0\n", err);
+                device = 0;
             }
         }
+
+#ifdef HOOK_DEBUG
+        fprintf(stderr, "[HOOK] DEBUG: No CUDA context found, creating context on device %d\n", device);
+#endif
+
+        // Initialize via CUDA runtime API (cudaSetDevice + cudaFree) instead of
+        // cuCtxCreate_v2. cuCtxCreate_v2 creates a non-primary context that gets
+        // destroyed when NCCL calls cuDevicePrimaryCtxReset during DP init.
+        // This orphans loaded modules in the dead context, causing cross-context
+        // graph execution overhead (~7x slowdown on DP>1).
+        // cudaSetDevice + cudaFree(0) creates the runtime's primary context which
+        // survives NCCL's context management.
+        typedef int (*cudaSetDevice_t)(int);
+        typedef int (*cudaFree_t)(void*);
+        auto set_dev = (cudaSetDevice_t)real_dlsym(RTLD_NEXT, "cudaSetDevice");
+        auto cuda_free = (cudaFree_t)real_dlsym(RTLD_NEXT, "cudaFree");
+        if (set_dev && cuda_free) {
+            int err = set_dev(device);
+            if (err != 0) {
+                fprintf(stderr, "[HOOK] ERROR: cudaSetDevice(%d) failed with error %d\n", device, err);
+                abort();
+            }
+            err = cuda_free(nullptr);
+            if (err != 0) {
+                fprintf(stderr, "[HOOK] ERROR: cudaFree(0) on device %d failed with error %d\n", device, err);
+                abort();
+            }
+            if (ctx_get_current) ctx_get_current(&ctx);
+            fprintf(stderr, "[HOOK] Initialized CUDA runtime primary context on device %d: ctx=%p\n", device, (void*)ctx);
+        } else {
+            fprintf(stderr, "[HOOK] ERROR: Could not find cudaSetDevice/cudaFree\n");
+            abort();
+        }
+    } else {
+#ifdef HOOK_DEBUG
+        // Context already exists - log which device it's on
+        typedef CUresult (*cuCtxGetDevice_t)(CUdevice*);
+        auto ctx_get_device = (cuCtxGetDevice_t)real_dlsym(RTLD_NEXT, "cuCtxGetDevice");
+        if (ctx_get_device) {
+            CUdevice existing_device = -1;
+            CUresult res = ctx_get_device(&existing_device);
+            if (res == CUDA_SUCCESS) {
+                fprintf(stderr, "[HOOK] DEBUG: Using existing CUDA context on device %d\n", existing_device);
+            }
+        }
+#endif
     }
 
-    std::call_once(load_once_flag, [&workspace_dir]() {
-        const fs::path packed_img_path = fs::path(workspace_dir) / "fatbin_image_packed.img";
-        const fs::path packed_txt_path = fs::path(workspace_dir) / "fatbin_entrypoint_packed.txt";
+    std::call_once(load_once_flag, [&archive_dir]() {
+        const fs::path packed_img_path = fs::path(archive_dir) / "fatbin_image_packed.img";
+        const fs::path packed_txt_path = fs::path(archive_dir) / "fatbin_entrypoint_packed.txt";
 
         if (!fs::exists(packed_img_path) || !fs::exists(packed_txt_path)) {
-            fprintf(stderr, "[HOOK] ERROR: Packed files not found in %s\n", workspace_dir.c_str());
+            fprintf(stderr, "[HOOK] ERROR: Packed files not found in %s\n", archive_dir.c_str());
             abort();
         }
 
@@ -2634,6 +3533,8 @@ void load_cuda_modules_and_libraries(const std::string& workspace_dir) {
             std::string func_name;
             ParsedOptions options;
             std::vector<std::string> entry_names;
+            // For device-linked binaries
+            std::vector<std::vector<uint8_t>> linked_segments;
         };
 
         std::vector<BinaryEntry> binaries;
@@ -2646,19 +3547,59 @@ void load_cuda_modules_and_libraries(const std::string& workspace_dir) {
             if (!img_file) break;
 
             img_file.read(reinterpret_cast<char*>(&size), sizeof(size_t));
-            if (!img_file || size == 0) {
-                fprintf(stderr, "[HOOK] ERROR: Invalid size in packed img\n");
-                abort();
-            }
-
-            std::vector<uint8_t> data(size);
-            img_file.read(reinterpret_cast<char*>(data.data()), size);
             if (!img_file) {
-                fprintf(stderr, "[HOOK] ERROR: Failed to read binary data\n");
+                fprintf(stderr, "[HOOK] ERROR: Failed to read size\n");
                 abort();
             }
 
-            binaries.push_back({hash, std::move(data), "", {}});
+            BinaryEntry entry;
+            entry.hash = hash;
+
+            if (size == 0) {
+                // Device-linked binary marker - read segment count and segments
+                size_t num_segments = 0;
+                img_file.read(reinterpret_cast<char*>(&num_segments), sizeof(size_t));
+                if (!img_file || num_segments == 0) {
+                    fprintf(stderr, "[HOOK] ERROR: Invalid segment count for device-linked binary\n");
+                    abort();
+                }
+
+#ifdef HOOK_DEBUG
+                fprintf(stderr, "[HOOK] DEBUG: Reading %zu linked segments for hash %016llx\n",
+                        num_segments, (unsigned long long)hash);
+#endif
+
+                for (size_t i = 0; i < num_segments; i++) {
+                    size_t seg_size = 0;
+                    img_file.read(reinterpret_cast<char*>(&seg_size), sizeof(size_t));
+                    if (!img_file || seg_size == 0) {
+                        fprintf(stderr, "[HOOK] ERROR: Invalid segment size\n");
+                        abort();
+                    }
+
+                    std::vector<uint8_t> seg_data(seg_size);
+                    img_file.read(reinterpret_cast<char*>(seg_data.data()), seg_size);
+                    if (!img_file) {
+                        fprintf(stderr, "[HOOK] ERROR: Failed to read segment data\n");
+                        abort();
+                    }
+
+                    entry.linked_segments.push_back(std::move(seg_data));
+#ifdef HOOK_DEBUG
+                    fprintf(stderr, "[HOOK] DEBUG:   segment[%zu] size: %zu bytes\n", i, seg_size);
+#endif
+                }
+            } else {
+                // Regular single binary
+                entry.data.resize(size);
+                img_file.read(reinterpret_cast<char*>(entry.data.data()), size);
+                if (!img_file) {
+                    fprintf(stderr, "[HOOK] ERROR: Failed to read binary data\n");
+                    abort();
+                }
+            }
+
+            binaries.push_back(std::move(entry));
         }
 
         size_t binary_idx = 0;
@@ -2710,6 +3651,10 @@ void load_cuda_modules_and_libraries(const std::string& workspace_dir) {
         typedef CUresult (*cuLibraryLoadData_t)(CUlibrary*, const void*, CUjit_option*, void**, unsigned int, CUlibraryOption*, void**, unsigned int);
         typedef CUresult (*cuModuleLoad_t)(CUmodule*, const char*);
         typedef CUresult (*cuLibraryLoadFromFile_t)(CUlibrary*, const char*, CUjit_option*, void**, unsigned int, CUlibraryOption*, void**, unsigned int);
+        typedef CUresult (*cuLinkCreate_t)(unsigned int, CUjit_option*, void**, CUlinkState*);
+        typedef CUresult (*cuLinkAddData_t)(CUlinkState, CUjitInputType, void*, size_t, const char*, unsigned int, CUjit_option*, void**);
+        typedef CUresult (*cuLinkComplete_t)(CUlinkState, void**, size_t*);
+        typedef CUresult (*cuLinkDestroy_t)(CUlinkState);
 
         auto module_load_data = (cuModuleLoadData_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuModuleLoadData);
         auto module_load_data_ex = (cuModuleLoadDataEx_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuModuleLoadDataEx);
@@ -2717,6 +3662,10 @@ void load_cuda_modules_and_libraries(const std::string& workspace_dir) {
         auto library_load_data = (cuLibraryLoadData_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuLibraryLoadData);
         auto module_load = (cuModuleLoad_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuModuleLoad);
         auto library_load_from_file = (cuLibraryLoadFromFile_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuLibraryLoadFromFile);
+        auto link_create = (cuLinkCreate_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuLinkCreate);
+        auto link_add_data = (cuLinkAddData_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuLinkAddData);
+        auto link_complete = (cuLinkComplete_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuLinkComplete);
+        auto link_destroy = (cuLinkDestroy_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuLinkDestroy);
 
         for (auto& binary : binaries) {
             if (binary.options.base_func_name == "cuLibraryLoadData") {
@@ -2728,13 +3677,75 @@ void load_cuda_modules_and_libraries(const std::string& workspace_dir) {
                 void** lib_vals = binary.options.library_option_values.empty() ? nullptr : binary.options.library_option_values.data();
                 unsigned int num_lib = binary.options.library_options.size();
 
-                CUresult res = library_load_data(&library, binary.data.data(), jit_opts, jit_vals, num_jit, lib_opts, lib_vals, num_lib);
-                if (res != CUDA_SUCCESS || !library) {
-                    fprintf(stderr, "[HOOK] ERROR: Failed to load library for hash %016llx, error=%d\n",
-                            (unsigned long long)binary.hash, res);
-                    abort();
+                CUresult res;
+
+                if (!binary.linked_segments.empty()) {
+                    // Device-linked binary - use CUDA linker to combine segments (fallback path)
+#ifdef HOOK_DEBUG
+                    fprintf(stderr, "[HOOK] DEBUG: Using device linker for %zu segments (hash %016llx)\n",
+                            binary.linked_segments.size(), (unsigned long long)binary.hash);
+#endif
+
+                    CUlinkState link_state;
+                    res = link_create(num_jit, jit_opts, jit_vals, &link_state);
+                    if (res != CUDA_SUCCESS) {
+                        fprintf(stderr, "[HOOK] ERROR: cuLinkCreate failed with error %d\n", res);
+                        abort();
+                    }
+
+                    // Add each segment to the linker
+                    for (size_t i = 0; i < binary.linked_segments.size(); i++) {
+                        auto& segment = binary.linked_segments[i];
+                        res = link_add_data(link_state, CU_JIT_INPUT_FATBINARY,
+                                           const_cast<uint8_t*>(segment.data()), segment.size(),
+                                           nullptr, 0, nullptr, nullptr);
+                        if (res != CUDA_SUCCESS) {
+                            fprintf(stderr, "[HOOK] ERROR: cuLinkAddData failed for segment %zu with error %d\n", i, res);
+                            link_destroy(link_state);
+                            abort();
+                        }
+#ifdef HOOK_DEBUG
+                        fprintf(stderr, "[HOOK] DEBUG:   Added segment %zu (%zu bytes) to linker\n", i, segment.size());
+#endif
+                    }
+
+                    // Complete linking
+                    void* cubin_out = nullptr;
+                    size_t cubin_size = 0;
+                    res = link_complete(link_state, &cubin_out, &cubin_size);
+                    if (res != CUDA_SUCCESS || !cubin_out) {
+                        fprintf(stderr, "[HOOK] ERROR: cuLinkComplete failed with error %d\n", res);
+                        link_destroy(link_state);
+                        abort();
+                    }
+#ifdef HOOK_DEBUG
+                    fprintf(stderr, "[HOOK] DEBUG: Device linking complete, output size: %zu bytes\n", cubin_size);
+#endif
+
+                    // Load the linked cubin as a library
+                    res = library_load_data(&library, cubin_out, jit_opts, jit_vals, num_jit, lib_opts, lib_vals, num_lib);
+                    link_destroy(link_state);
+
+                    if (res != CUDA_SUCCESS || !library) {
+                        fprintf(stderr, "[HOOK] ERROR: Failed to load device-linked library for hash %016llx, error=%d\n",
+                                (unsigned long long)binary.hash, res);
+                        abort();
+                    }
+                } else {
+                    // Regular single binary (or pre-linked cubin from SAVE mode)
+#ifdef HOOK_DEBUG
+                    fprintf(stderr, "[HOOK] DEBUG: Loading library hash %016llx, size: %zu bytes, %zu kernels\n",
+                            (unsigned long long)binary.hash, binary.data.size(), binary.entry_names.size());
+#endif
+
+                    res = library_load_data(&library, binary.data.data(), jit_opts, jit_vals, num_jit, lib_opts, lib_vals, num_lib);
+                    if (res != CUDA_SUCCESS || !library) {
+                        fprintf(stderr, "[HOOK] ERROR: Failed to load library for hash %016llx, error=%d\n",
+                                (unsigned long long)binary.hash, res);
+                        abort();
+                    }
                 }
-                setup_handles_for_library(library, binary.hash, binary.entry_names);
+                setup_handles_for_library(library, binary.hash, binary.entry_names, binary.options.binary_flags & BINARY_FLAG_REQUIRES_NVSHMEM);
             } else if (binary.options.base_func_name == "cuModuleLoadDataEx") {
                 CUmodule module = nullptr;
                 CUjit_option* jit_opts = binary.options.jit_options.empty() ? nullptr : binary.options.jit_options.data();
@@ -2747,7 +3758,7 @@ void load_cuda_modules_and_libraries(const std::string& workspace_dir) {
                             (unsigned long long)binary.hash, res);
                     abort();
                 }
-                setup_handles_for_module(module, binary.hash, binary.entry_names);
+                setup_handles_for_module(module, binary.hash, binary.entry_names, binary.options.binary_flags & BINARY_FLAG_REQUIRES_NVSHMEM);
             } else if (binary.options.base_func_name == "cuModuleLoadData") {
                 CUmodule module = nullptr;
                 CUresult res = module_load_data(&module, binary.data.data());
@@ -2756,7 +3767,7 @@ void load_cuda_modules_and_libraries(const std::string& workspace_dir) {
                             (unsigned long long)binary.hash, res);
                     abort();
                 }
-                setup_handles_for_module(module, binary.hash, binary.entry_names);
+                setup_handles_for_module(module, binary.hash, binary.entry_names, binary.options.binary_flags & BINARY_FLAG_REQUIRES_NVSHMEM);
             } else if (binary.options.base_func_name == "cuModuleLoadFatBinary") {
                 CUmodule module = nullptr;
                 CUresult res = module_load_fatbinary(&module, binary.data.data());
@@ -2765,14 +3776,14 @@ void load_cuda_modules_and_libraries(const std::string& workspace_dir) {
                             (unsigned long long)binary.hash, res);
                     abort();
                 }
-                setup_handles_for_module(module, binary.hash, binary.entry_names);
+                setup_handles_for_module(module, binary.hash, binary.entry_names, binary.options.binary_flags & BINARY_FLAG_REQUIRES_NVSHMEM);
             } else if (binary.options.base_func_name == "cuModuleLoad") {
                 if (binary.options.filename.empty()) {
                     fprintf(stderr, "[HOOK] ERROR: No filename found for cuModuleLoad\n");
                     abort();
                 }
 
-                const fs::path temp_file_path = fs::path(workspace_dir) / str(boost::format("temp_module_%016llx.bin") % binary.hash);
+                const fs::path temp_file_path = fs::path(archive_dir) / str(boost::format("temp_module_%016llx.bin") % binary.hash);
                 std::ofstream temp_file(temp_file_path.string(), std::ios::binary);
                 if (!temp_file) {
                     fprintf(stderr, "[HOOK] ERROR: Failed to create temporary file for module loading\n");
@@ -2791,14 +3802,14 @@ void load_cuda_modules_and_libraries(const std::string& workspace_dir) {
                             (unsigned long long)binary.hash, res);
                     abort();
                 }
-                setup_handles_for_module(module, binary.hash, binary.entry_names);
+                setup_handles_for_module(module, binary.hash, binary.entry_names, binary.options.binary_flags & BINARY_FLAG_REQUIRES_NVSHMEM);
             } else if (binary.options.base_func_name == "cuLibraryLoadFromFile") {
                 if (binary.options.filename.empty()) {
                     fprintf(stderr, "[HOOK] ERROR: No filename found for cuLibraryLoadFromFile\n");
                     abort();
                 }
 
-                const fs::path temp_file_path = fs::path(workspace_dir) / str(boost::format("temp_library_%016llx.bin") % binary.hash);
+                const fs::path temp_file_path = fs::path(archive_dir) / str(boost::format("temp_library_%016llx.bin") % binary.hash);
                 std::ofstream temp_file(temp_file_path.string(), std::ios::binary);
                 if (!temp_file) {
                     fprintf(stderr, "[HOOK] ERROR: Failed to create temporary file for library loading\n");
@@ -2824,7 +3835,7 @@ void load_cuda_modules_and_libraries(const std::string& workspace_dir) {
                             (unsigned long long)binary.hash, res);
                     abort();
                 }
-                setup_handles_for_library(library, binary.hash, binary.entry_names);
+                setup_handles_for_library(library, binary.hash, binary.entry_names, binary.options.binary_flags & BINARY_FLAG_REQUIRES_NVSHMEM);
             } else {
                 fprintf(stderr, "[HOOK] ERROR: Unknown function name: %s\n", binary.options.base_func_name.c_str());
                 abort();

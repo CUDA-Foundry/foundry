@@ -18,7 +18,7 @@ target_include_directories(cuda_hook PRIVATE
 )
 
 target_link_libraries(cuda_hook PRIVATE
-    # NOTE(yongji): cuda_hook should link against
+    # NOTE: cuda_hook should link against
     # neither CUDA driver or CUDA runtime
     # CUDA::cuda_driver
     dl

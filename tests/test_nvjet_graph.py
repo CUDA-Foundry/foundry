@@ -13,6 +13,8 @@ BASE_ADDR = 0x2F0000000000
 REGION_SIZE_STR = "1GB"
 ARCHIVE_DIR = "test_archive"
 HOOK_ARCHIVE_DIR = "hook_archive"
+M, N, K = 192, 192, 4096
+DTYPE = torch.float16
 
 
 def _get_hook_so_path():
@@ -49,9 +51,9 @@ def _run_saving_run():
     fdry.set_allocation_region(BASE_ADDR, region_size)
     print(f"[SAVING] Allocation region set: base=0x{BASE_ADDR:x}, size={REGION_SIZE_STR}")
 
-    input_tensor_a = torch.full((128, 64), 2.0, device=device)
-    input_tensor_b = torch.full((64, 32), 3.0, device=device)
-    output_tensor = torch.zeros(128, 32, device=device)
+    input_tensor_a = torch.full((M, K), 2.0, device=device, dtype=DTYPE)
+    input_tensor_b = torch.full((K, N), 3.0, device=device, dtype=DTYPE)
+    output_tensor = torch.zeros(M, N, device=device, dtype=DTYPE)
     print(f"[SAVING] input_a address: 0x{input_tensor_a.data_ptr():x}")
     print(f"[SAVING] input_b address: 0x{input_tensor_b.data_ptr():x}")
     print(f"[SAVING] output address: 0x{output_tensor.data_ptr():x}")
@@ -105,9 +107,9 @@ def _run_loading_run():
     fdry.set_allocation_region(BASE_ADDR, region_size)
     print(f"[LOADING] Allocation region set: base=0x{BASE_ADDR:x}, size={REGION_SIZE_STR}")
 
-    input_tensor_a = torch.full((128, 64), 5.0, device=device)
-    input_tensor_b = torch.full((64, 32), 3.0, device=device)
-    output_tensor = torch.zeros(128, 32, device=device)
+    input_tensor_a = torch.full((M, K), 2.0, device=device, dtype=DTYPE)
+    input_tensor_b = torch.full((K, N), 3.0, device=device, dtype=DTYPE)
+    output_tensor = torch.zeros(M, N, device=device, dtype=DTYPE)
     print(f"[LOADING] input_a address: 0x{input_tensor_a.data_ptr():x}")
     print(f"[LOADING] input_b address: 0x{input_tensor_b.data_ptr():x}")
     print(f"[LOADING] output address: 0x{output_tensor.data_ptr():x}")

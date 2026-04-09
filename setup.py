@@ -116,6 +116,8 @@ ext_modules = [
         sources=[
             'csrc/binding.cpp',
             'csrc/CUDAGraph.cpp',
+            'csrc/CUDAGraphParallel.cpp',
+            'csrc/BinaryGraphIO.cpp',
         ],
         include_dirs=common_include_dirs,
         library_dirs=common_library_dirs,

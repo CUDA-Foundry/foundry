@@ -2,6 +2,7 @@ from .ops import *
 from .graph import (
     CUDAGraph,
     graph,
+    save_graph_manifest,
 )
 from .allocation_region import (
     allocation_region,

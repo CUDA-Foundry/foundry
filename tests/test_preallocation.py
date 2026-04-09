@@ -114,7 +114,7 @@ def _run_core_fallback():
             tensors.append(t)
             print(f"[TEST] Allocated tensor {i}: ptr=0x{t.data_ptr():x}")
 
-        print("[TEST] Successfully allocated beyond preallocated region")
+        print("[TEST] Successfully allocated beyond preallocated region, you are expected to see an error message from the hook")
 
         del tensors
         torch.cuda.empty_cache()

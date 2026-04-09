@@ -34,6 +34,8 @@ void set_current_alloc_offset(size_t offset);
 void set_pack_fatbins_on_exit(bool enabled);
 void pack_fatbins_to_folder(const std::string& folder_path);
 void set_skip_fatbin_processing(bool enabled);
+void set_nvshmem_auto_init(bool enabled);
+int init_nvshmem_for_loaded_modules();
 
 void start_hook_record();
 void end_hook_record();
@@ -44,7 +46,7 @@ void replay_hook_events_from_json(const boost::json::object& events_obj);
 std::variant<CUfunction, CUkernel> query_function_handle(uint64_t binary_hash, const std::string& function_name);
 uint64_t query_binary_hash(std::variant<CUmodule, CUlibrary> handle);
 void mark_binary_used(uint64_t binary_hash);
-void load_cuda_modules_and_libraries(const std::string& workspace_dir);
+void load_cuda_modules_and_libraries(const std::string& archive_dir);
 
 }
 #endif

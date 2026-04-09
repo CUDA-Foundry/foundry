@@ -3,6 +3,7 @@
 #include <pybind11/stl.h>
 #include <cstring>
 #include "CUDAGraph.h"
+#include "CUDAGraphInternal.h"
 #include "metadata.h"
 #include "hook.h"
 
@@ -53,13 +54,21 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     ::foundry::set_skip_fatbin_processing(enabled);
   }, py::arg("enabled"), "Skip heavy fatbin processing in LOAD mode for faster startup");
 
+  m.def("set_nvshmem_auto_init", [](bool enabled) {
+    ::foundry::set_nvshmem_auto_init(enabled);
+  }, py::arg("enabled"), "Enable/disable automatic NVSHMEM initialization for DeepEP kernels on load (default: true)");
+
+  m.def("init_nvshmem_for_loaded_modules", []() {
+    return ::foundry::init_nvshmem_for_loaded_modules();
+  }, "Initialize NVSHMEM for all already-loaded modules that require it. Call AFTER NVSHMEM runtime is initialized (e.g., after DeepEP Buffer creation). Returns count of modules initialized.");
+
   m.def("pack_fatbins_to_folder", [](const std::string& folder_path) {
     ::foundry::pack_fatbins_to_folder(folder_path);
   }, py::arg("folder_path"), "Pack all loaded fatbins/cubins to the specified folder");
 
-  m.def("load_cuda_modules_and_libraries", [](const std::string& workspace_dir) {
-    ::foundry::load_cuda_modules_and_libraries(workspace_dir);
-  }, py::arg("workspace_dir"), "Load CUDA modules and libraries from workspace directory");
+  m.def("load_cuda_modules_and_libraries", [](const std::string& archive_dir) {
+    ::foundry::load_cuda_modules_and_libraries(archive_dir);
+  }, py::arg("archive_dir"), "Load CUDA modules and libraries from archive directory");
 
   m.def("preallocate_cublas_workspaces", []() {
     ::foundry::preallocate_cublas_workspaces();
@@ -84,6 +93,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def_readonly("sharedMemBytes", &::foundry::KernelNodeMetadata::sharedMemBytes)
       .def_readonly("num_params", &::foundry::KernelNodeMetadata::num_params)
       .def_readonly("offset_and_sizes", &::foundry::KernelNodeMetadata::offset_and_sizes);
+
+  py::class_<::foundry::PendingGraphLoads,
+              std::shared_ptr<::foundry::PendingGraphLoads>>(m, "PendingGraphLoads");
 
   shared_ptr_class_<::foundry::CUDAGraph>(m, "CUDAGraph")
       .def(py::init<bool>(), py::arg("keep_graph") = false)
@@ -239,5 +251,63 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             return py::make_tuple(load_result.graph, output_tensors);
           },
           py::arg("json_path"),
-          py::arg("pool") = py::none());
+          py::arg("pool") = py::none())
+      .def_static(
+          "start_graph_builds",
+          [](const std::vector<std::string>& json_paths,
+             std::optional<c10::MempoolId_t> pool_opt,
+             int num_threads) {
+            c10::MempoolId_t pool = pool_opt.has_value() ? pool_opt.value() : c10::MempoolId_t{0, 0};
+
+            std::shared_ptr<::foundry::PendingGraphLoads> pending;
+            {
+              py::gil_scoped_release release;
+              pending = ::foundry::CUDAGraph::start_graph_builds(json_paths, pool, num_threads);
+            }
+            return pending;
+          },
+          py::arg("json_paths"),
+          py::arg("pool") = py::none(),
+          py::arg("num_threads") = 4)
+      .def_static(
+          "finish_graph_loads",
+          [](std::shared_ptr<::foundry::PendingGraphLoads> pending) {
+            std::vector<::foundry::GraphLoadResult> load_results;
+            {
+              py::gil_scoped_release release;
+              load_results = ::foundry::CUDAGraph::finish_graph_loads(std::move(pending));
+            }
+
+            py::list result_list;
+            for (auto& load_result : load_results) {
+              py::object output_tensors = py::none();
+              if (load_result.output_type == ::foundry::OutputTensorType::Single) {
+                if (std::holds_alternative<at::Tensor>(load_result.outputs)) {
+                  output_tensors = py::cast(std::get<at::Tensor>(load_result.outputs));
+                }
+              } else if (load_result.output_type == ::foundry::OutputTensorType::List) {
+                if (std::holds_alternative<std::vector<at::Tensor>>(load_result.outputs)) {
+                  py::list tensor_list;
+                  for (const auto& t : std::get<std::vector<at::Tensor>>(load_result.outputs)) {
+                    tensor_list.append(py::cast(t));
+                  }
+                  output_tensors = tensor_list;
+                }
+              } else if (load_result.output_type == ::foundry::OutputTensorType::Tuple) {
+                if (std::holds_alternative<std::vector<at::Tensor>>(load_result.outputs)) {
+                  const auto& tensors = std::get<std::vector<at::Tensor>>(load_result.outputs);
+                  py::tuple tensor_tuple(tensors.size());
+                  for (size_t i = 0; i < tensors.size(); ++i) {
+                    tensor_tuple[i] = py::cast(tensors[i]);
+                  }
+                  output_tensors = tensor_tuple;
+                }
+              }
+
+              result_list.append(py::make_tuple(load_result.graph, output_tensors));
+            }
+
+            return result_list;
+          },
+          py::arg("pending"));
 }

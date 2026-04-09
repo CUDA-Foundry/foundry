@@ -12,8 +12,8 @@ import torch.nn as nn
 BASE_ADDR = 0x7f0000000000
 GRAPH_BASE_ADDR = 0x80000000000
 REGION_SIZE_STR = "1GB"
-WORKSPACE_DIR = "test_workspace"
-HOOK_WORKSPACE_DIR = "hook_workspace"
+ARCHIVE_DIR = "test_archive"
+HOOK_ARCHIVE_DIR = "hook_archive"
 
 
 def _get_hook_so_path():
@@ -44,7 +44,7 @@ def _run_saving_run():
     device = torch.device('cuda:0')
     torch.set_default_device(device)
 
-    os.makedirs(WORKSPACE_DIR, exist_ok=True)
+    os.makedirs(ARCHIVE_DIR, exist_ok=True)
 
     region_size = fdry.parse_size(REGION_SIZE_STR)
 
@@ -74,7 +74,7 @@ def _run_saving_run():
     graph.replay()
     torch.cuda.synchronize()
 
-    graph_json = os.path.join(WORKSPACE_DIR, "graph.json")
+    graph_json = os.path.join(ARCHIVE_DIR, "graph.json")
 
     print(f"[TEST] Saving Run: Saving graph with output tensor to {graph_json}")
     graph.save(graph_json, output_tensors=result)
@@ -99,18 +99,18 @@ def _run_loading_run():
     torch.set_default_device(device)
     torch.cuda.set_device(device)
 
-    if not os.path.exists(WORKSPACE_DIR):
-        raise RuntimeError(f"Workspace directory {WORKSPACE_DIR} not found")
+    if not os.path.exists(ARCHIVE_DIR):
+        raise RuntimeError(f"Archive directory {ARCHIVE_DIR} not found")
 
-    print(f"[TEST] Loading Run: Loading CUDA modules and libraries from {HOOK_WORKSPACE_DIR}")
-    fdry.load_cuda_modules_and_libraries(HOOK_WORKSPACE_DIR)
+    print(f"[TEST] Loading Run: Loading CUDA modules and libraries from {HOOK_ARCHIVE_DIR}")
+    fdry.load_cuda_modules_and_libraries(HOOK_ARCHIVE_DIR)
 
     region_size = fdry.parse_size(REGION_SIZE_STR)
 
     print("[TEST] Loading Run: Setting up allocation region")
     fdry.set_allocation_region(BASE_ADDR, region_size)
 
-    graph_json = os.path.join(WORKSPACE_DIR, "graph.json")
+    graph_json = os.path.join(ARCHIVE_DIR, "graph.json")
 
     print("[TEST] Loading Run: Allocating input tensors with different values")
     input_tensor_a = torch.full((100, 100), 5.0, device=device)
@@ -142,14 +142,14 @@ def _run_loading_run():
     print("[TEST] Loading Run: Completed successfully")
 
 
-def _cleanup_workspace():
-    if os.path.exists(WORKSPACE_DIR):
-        shutil.rmtree(WORKSPACE_DIR)
-        print(f"[TEST] Cleaned up {WORKSPACE_DIR}")
+def _cleanup_archive():
+    if os.path.exists(ARCHIVE_DIR):
+        shutil.rmtree(ARCHIVE_DIR)
+        print(f"[TEST] Cleaned up {ARCHIVE_DIR}")
 
-    if os.path.exists(HOOK_WORKSPACE_DIR):
-        shutil.rmtree(HOOK_WORKSPACE_DIR)
-        print(f"[TEST] Cleaned up {HOOK_WORKSPACE_DIR}")
+    if os.path.exists(HOOK_ARCHIVE_DIR):
+        shutil.rmtree(HOOK_ARCHIVE_DIR)
+        print(f"[TEST] Cleaned up {HOOK_ARCHIVE_DIR}")
 
 
 def _spawn_with_preload(launch_mode):
@@ -169,7 +169,7 @@ def test_graph_save_and_load():
     """Test CUDA graph save/load with binary dumping and allocator replay"""
     print("\n[TEST] Starting test_graph_save_and_load")
 
-    _cleanup_workspace()
+    _cleanup_archive()
 
     print("[TEST] Running saving run (capture and save)")
     _spawn_with_preload('saving-run')
@@ -177,7 +177,7 @@ def test_graph_save_and_load():
     print("[TEST] Running loading run (load and replay)")
     _spawn_with_preload('loading-run')
 
-    _cleanup_workspace()
+    _cleanup_archive()
 
     print("[TEST] test_graph_save_and_load PASSED")
 
@@ -188,6 +188,6 @@ if __name__ == '__main__':
     elif '--loading-run' in sys.argv:
         _run_loading_run()
     elif '--cleanup' in sys.argv:
-        _cleanup_workspace()
+        _cleanup_archive()
     else:
         test_graph_save_and_load()
