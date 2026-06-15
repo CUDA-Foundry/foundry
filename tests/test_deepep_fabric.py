@@ -77,6 +77,27 @@ def _init_dist(local_rank: int, num_local_ranks: int):
     )
 
 
+def _maybe_warm_nccl_pre_region(group):
+    """Diagnostic knob (TEST_NCCL_WARMUP_PRE_REGION=1): force NCCL transport
+    setup BEFORE the foundry region exists, so NCCL's cuMem allocations
+    (NCCL_CUMEM_ENABLE=1) pass through untracked. Localizes whether the
+    NCCL-CUMEM incompatibility is "NCCL cuMem while region enabled" only.
+    The warmup tensor's caching-allocator segment is drained afterwards so
+    post-region allocations don't reuse an untracked (non-deterministic)
+    segment.
+    """
+    if os.environ.get("TEST_NCCL_WARMUP_PRE_REGION", "0") != "1":
+        return
+    t = torch.ones(1024, 1024, device="cuda")
+    dist.all_reduce(t)  # default group: ring/p2p transport setup
+    dist.all_reduce(t, group=group)  # subgroup used by the DeepEP Buffer
+    dist.all_gather_object([None] * dist.get_world_size(), 0)  # object-coll path
+    torch.cuda.synchronize()
+    del t
+    torch.cuda.empty_cache()  # legal here: region not set yet, no captures
+    print("[TEST] NCCL pre-region warmup done (transports up before region)", flush=True)
+
+
 def _create_deterministic_inputs(
     rank: int, num_tokens: int, hidden: int, num_experts: int, num_topk: int
 ):
@@ -262,6 +283,8 @@ def _run_save(local_rank: int, num_processes: int):
     hidden = 2048  # Must be a supported size for DeepEP low-latency kernels
     num_experts = num_ranks * 4  # 4 experts per rank
     num_topk = 2
+
+    _maybe_warm_nccl_pre_region(group)
 
     # Setup allocation region
     region_size = fdry.parse_size(REGION_SIZE_STR)
@@ -487,10 +510,21 @@ def _run_load(local_rank: int, num_processes: int):
     print(f"[Rank {rank}] LOAD: Loading CUDA modules from {rank_archive}", flush=True)
     fdry.load_cuda_modules_and_libraries(rank_archive)
 
+    _maybe_warm_nccl_pre_region(group)
+
     # Step 2: Setup allocation region
     region_size = fdry.parse_size(REGION_SIZE_STR)
     print(f"[Rank {rank}] LOAD: Setting up allocation region at {hex(BASE_ADDR)}", flush=True)
     fdry.set_allocation_region(BASE_ADDR, region_size)
+
+    # Optional (TEST_LOAD_PREALLOC_MB=N): reproduce the production LOAD shape -
+    # one upfront-preallocated chunk that subsequent allocations (including the
+    # DeepEP NVL buffer) carve from with NO individual cuMem handle. This
+    # exercises the hook's whole-chunk VMM-IPC export path.
+    prealloc_mb = int(os.environ.get("TEST_LOAD_PREALLOC_MB", "0"))
+    if prealloc_mb > 0:
+        assert fdry.preallocate_region(prealloc_mb * 1024 * 1024), "preallocate_region failed"
+        print(f"[Rank {rank}] LOAD: preallocated {prealloc_mb} MB chunk", flush=True)
 
     # Step 3: Create DeepEP buffer (initializes NVSHMEM runtime)
     num_local_experts = num_experts // num_ranks
@@ -499,13 +533,17 @@ def _run_load(local_rank: int, num_processes: int):
     )
 
     use_fabric = os.environ.get("TEST_USE_FABRIC", "1") == "1"
+    # Must match SAVE: an NVL buffer allocated on SAVE but not LOAD (or vice versa)
+    # diverges the allocation trajectory and the peer-pointer setup.
+    num_nvl_bytes = int(os.environ.get("TEST_NVL_BYTES_MB", "0")) * 1024 * 1024
     print(
-        f"[Rank {rank}] LOAD: Creating DeepEP buffer with use_fabric={use_fabric}, size={num_rdma_bytes / 1e6:.2f} MB",
+        f"[Rank {rank}] LOAD: Creating DeepEP buffer with use_fabric={use_fabric}, num_nvl_bytes={num_nvl_bytes / 1e6:.2f} MB, num_rdma_bytes={num_rdma_bytes / 1e6:.2f} MB",
         flush=True,
     )
 
     buffer = deep_ep.Buffer(
         group,
+        num_nvl_bytes=num_nvl_bytes,
         num_rdma_bytes=num_rdma_bytes,
         low_latency_mode=True,
         num_qps_per_rank=num_local_experts,
@@ -593,10 +631,21 @@ def _run_load(local_rank: int, num_processes: int):
         flush=True,
     )
 
-    # Load graph from per-rank archive
+    # Load graph from per-rank archive.
+    # Default: the production path (start_graph_builds + finish_graph_loads),
+    # same machinery the vLLM/sglang integrations use. TEST_LOAD_API=single
+    # selects the legacy CUDAGraph.load path — KNOWN BROKEN for DeepEP graphs:
+    # it does not merge root-level common_kernel_node_attrs, so factored-out
+    # cooperative/clusterDim attrs are dropped and the dispatch kernel faults
+    # with "unspecified launch failure" at replay.
     graph_json = os.path.join(rank_archive, "deepep_dispatch_graph.json")
-    print(f"[Rank {rank}] LOAD: Loading graph from {graph_json}", flush=True)
-    graph, output_tensors = fdry.CUDAGraph.load(graph_json)
+    load_api = os.environ.get("TEST_LOAD_API", "parallel")
+    print(f"[Rank {rank}] LOAD: Loading graph from {graph_json} (api={load_api})", flush=True)
+    if load_api == "single":
+        graph, output_tensors = fdry.CUDAGraph.load(graph_json)
+    else:
+        pending = fdry.CUDAGraph.start_graph_builds([graph_json])
+        ((graph, output_tensors),) = fdry.CUDAGraph.finish_graph_loads(pending)
     print(f"[Rank {rank}] LOAD: Graph loaded successfully", flush=True)
 
     # Print loaded output tensor info

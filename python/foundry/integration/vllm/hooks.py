@@ -741,12 +741,22 @@ def _patch_deepep() -> None:
     def patched(self, *args, **kwargs):
         out = orig(self, *args, **kwargs)
         if isinstance(out, dict) and get_graph_extension_mode() != CUDAGraphExtensionMode.NONE:
-            # Force VMM-fabric buffers
-            # so the foundry cuMem hook tracks them, and disable the
-            # NVLink buffer (LL-mode uses RDMA) to avoid fabric-cuMemCreate
-            # collisions with preallocated region.
-            out["use_fabric"] = True
-            out["num_nvl_bytes"] = 0
+            if os.environ.get("FOUNDRY_DEEPEP_NVL_IPC", "0") == "1":
+                # Keep upstream's NVLink buffer (legacy cudaIpc sharing). The
+                # hook's VMM-IPC layer transports the fds via SCM_RIGHTS and
+                # maps peers at relocated VAs, which DeepEP absorbs through
+                # its buffer_ptrs_gpu device table - peer VAs are never baked
+                # into captured graphs. use_fabric stays off: fabric
+                # cuMemCreate needs IMEX, and exercising the IPC path is the
+                # point of this mode.
+                out["use_fabric"] = False
+            else:
+                # Default: force VMM-fabric buffers
+                # so the foundry cuMem hook tracks them, and disable the
+                # NVLink buffer (LL-mode uses RDMA) to avoid fabric-cuMemCreate
+                # collisions with preallocated region.
+                out["use_fabric"] = True
+                out["num_nvl_bytes"] = 0
         return out
 
     cls._make_all2all_kwargs = patched

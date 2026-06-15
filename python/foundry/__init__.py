@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the Foundry project
+# The ops wildcard must come FIRST: .graph's CUDAGraph (and the
+# allocation_region helpers) intentionally override the raw pybind names.
 from .allocation_region import (
     allocation_region,
     free_preallocated_region,

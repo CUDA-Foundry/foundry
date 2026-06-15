@@ -14,12 +14,20 @@
 #include <mutex>
 #include <variant>
 #include <tuple>
+#include <map>
 #include <unordered_map>
 #include <unordered_set>
 #include <fstream>
 #include <vector>
 #include <string_view>
 #include <unistd.h>
+#include <fcntl.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <sys/un.h>
+#include <cstddef>
+#include <cerrno>
+#include <thread>
 #include <boost/unordered/concurrent_flat_map.hpp>
 #include <boost/filesystem.hpp>
 #include <boost/crc.hpp>
@@ -252,6 +260,24 @@ static thread_local ThreadLocalStorage tls_storage;
 static std::once_flag default_allocation_region_flag;
 static boost::unordered::concurrent_flat_map<CUdeviceptr, AllocMetadata> global_alloc_metadata;
 static boost::unordered::concurrent_flat_map<CUdeviceptr, size_t> global_carved_reserve_metadata;
+
+// Defined in the VMM-IPC section below (inside the extern "C" block, hence
+// the matching linkage here); closes and forgets the exported fd for a VA
+// when its allocation is freed (an exported fd keeps the physical pages
+// alive and would otherwise serve stale memory to importers).
+extern "C" {
+static void vmm_ipc_invalidate_export(CUdeviceptr dptr);
+}
+
+// Process-global mirror of the LOAD-mode preallocated chunk (the authoritative
+// copy lives in tls_storage, which the VMM-IPC export path cannot rely on:
+// cuIpcGetMemHandle may be called from a different thread than the one that
+// preallocated). Set by preallocate_region, cleared by
+// free_preallocated_region. Chunk carves have metadata.handle == 0, so
+// exporting them means exporting THIS handle plus an offset.
+static std::atomic<unsigned long long> g_prealloc_handle{0};
+static std::atomic<uint64_t> g_prealloc_base{0};
+static std::atomic<uint64_t> g_prealloc_size{0};
 
 struct HookAllocationEvent {
   enum class Type { Alloc, Free, Reserve };
@@ -2657,6 +2683,7 @@ CUresult cuMemFree_v2(CUdeviceptr dptr) {
       mem_addr_free_func(metadata.ptr, metadata.size);
     }
 
+    vmm_ipc_invalidate_export(dptr);
     global_alloc_metadata.erase_if(
         [dptr](const std::pair<const CUdeviceptr, AllocMetadata>& kv) { return kv.first == dptr; });
 
@@ -2868,8 +2895,239 @@ void* dlsym(void* handle, const char* symbol) {
 // VMM allocations by translating to cuMemExportToShareableHandle API
 // =============================================================================
 
-// Magic marker to identify VMM IPC handles in CUipcMemHandle
-static constexpr uint32_t VMM_IPC_MAGIC = 0x564D4D49;  // "VMMI"
+// Magic marker to identify VMM IPC handles in CUipcMemHandle.
+// v2 ("VMM2"): the blob carries {magic, exporter pid, original ptr, aligned size}.
+// The POSIX fd itself is transferred via SCM_RIGHTS over a per-process abstract
+// unix socket (a raw fd integer is meaningless in another process - the v1 bug
+// behind "cuMemImportFromShareableHandle failed with error 999").
+static constexpr uint32_t VMM_IPC_MAGIC = 0x564D4D32;  // "VMM2"
+
+// ---------------------------------------------------------------------------
+// VMM-IPC fd transport: each exporting process runs one server thread on an
+// abstract unix socket "\0foundry-vmm-ipc.<pid>". Importers connect, send the
+// 8-byte exporter VA they want, and receive the exported fd via SCM_RIGHTS.
+// The server does no CUDA calls: fds are exported on the cuIpcGetMemHandle
+// caller's thread and parked in vmm_ipc_exported_fds.
+// ---------------------------------------------------------------------------
+
+// exporter VA -> (allocation handle it was exported from, fd). The handle is
+// kept so VA reuse after free/realloc invalidates the cached fd.
+static boost::unordered::concurrent_flat_map<CUdeviceptr,
+                                             std::pair<CUmemGenericAllocationHandle, int>>
+    vmm_ipc_exported_fds;
+static std::mutex vmm_ipc_server_mutex;
+static int vmm_ipc_listen_fd = -1;
+// pid that owns the running server thread. fork() copies this .so's state but
+// not threads, so a forked child must rebind its own socket (vLLM's default
+// worker start method is fork).
+static pid_t vmm_ipc_server_pid = -1;
+// Per-process random token carried in the handle blob and verified by the
+// server: defends against pid reuse (a recycled pid + the deterministic
+// shared-base VAs would otherwise let an importer silently fetch a different
+// process's allocation).
+static uint64_t vmm_ipc_token = 0;
+
+// Wire format of a fetch request.
+struct VmmIpcRequest {
+  uint64_t ptr;
+  uint64_t token;
+};
+
+static void vmm_ipc_set_timeouts(int fd) {
+  struct timeval tv = {30, 0};
+  setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+  setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+}
+
+// Imported whole-chunk mappings (LOAD-mode exports: a buffer carved from the
+// peer's preallocated chunk is shared by exporting the chunk handle plus an
+// offset; cuMemMap cannot map a sub-range of an imported handle, so we map
+// the entire peer chunk once and hand out interior pointers). Keyed by
+// (exporter pid, exporter chunk base). Refcounted by open/close calls.
+struct VmmIpcChunkMapping {
+  CUdeviceptr local_base;
+  size_t size;
+  CUmemGenericAllocationHandle handle;
+  int refcount;
+};
+static std::mutex vmm_ipc_chunk_mutex;
+static std::map<std::pair<pid_t, uint64_t>, VmmIpcChunkMapping> vmm_ipc_chunk_mappings;
+// interior pointer handed to a caller -> owning chunk key (for close)
+static std::map<CUdeviceptr, std::pair<pid_t, uint64_t>> vmm_ipc_chunk_subptrs;
+
+// Dedicated VA zone for relocated peer imports, far below the foundry region
+// (default 0x600000000000) and the large-reserve zone right above region end.
+// Without this, the driver tends to place a relocated import immediately
+// after the region reservation - exactly where the hooked large-reserve hint
+// sends the NVSHMEM symmetric heap next, which silently breaks the heap's
+// SAVE/LOAD address determinism (observed: heap displaced by a peer-chunk
+// import landing at region_end).
+static std::atomic<uint64_t> vmm_ipc_import_hint{0x300000000000ULL};
+
+static socklen_t vmm_ipc_socket_addr(pid_t pid, struct sockaddr_un* addr) {
+  memset(addr, 0, sizeof(*addr));
+  addr->sun_family = AF_UNIX;
+  // Abstract namespace (sun_path[0] == '\0'): no filesystem entry, vanishes
+  // with the process.
+  int n = snprintf(addr->sun_path + 1, sizeof(addr->sun_path) - 2, "foundry-vmm-ipc.%d", (int)pid);
+  return (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + n);
+}
+
+static void vmm_ipc_server_loop(int listen_fd) {
+  while (true) {
+    int conn = accept(listen_fd, nullptr, nullptr);
+    if (conn < 0) {
+      if (errno == EBADF || errno == EINVAL)
+        break;   // socket gone
+      continue;  // EINTR/ECONNABORTED/EMFILE/... are transient
+    }
+    vmm_ipc_set_timeouts(conn);
+    // Abstract sockets have no filesystem permissions: only serve same-uid peers.
+    struct ucred cred;
+    socklen_t cred_len = sizeof(cred);
+    if (getsockopt(conn, SOL_SOCKET, SO_PEERCRED, &cred, &cred_len) != 0 || cred.uid != getuid()) {
+      close(conn);
+      continue;
+    }
+    VmmIpcRequest req = {};
+    int fd = -1;
+    if (recv(conn, &req, sizeof(req), MSG_WAITALL) == (ssize_t)sizeof(req) &&
+        req.token == vmm_ipc_token) {
+      // Dup under the map lock: the export path may concurrently close and
+      // replace the parked fd (stale-entry refresh); the dup we send is ours.
+      vmm_ipc_exported_fds.visit(
+          (CUdeviceptr)req.ptr,
+          [&](const std::pair<const CUdeviceptr, std::pair<CUmemGenericAllocationHandle, int>>&
+                  kv) { fd = fcntl(kv.second.second, F_DUPFD_CLOEXEC, 0); });
+    }
+    char status = (fd >= 0) ? 0 : 1;
+    struct iovec iov = {&status, 1};
+    char cbuf[CMSG_SPACE(sizeof(int))] = {};
+    struct msghdr msg = {};
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    if (fd >= 0) {
+      msg.msg_control = cbuf;
+      msg.msg_controllen = CMSG_SPACE(sizeof(int));
+      struct cmsghdr* c = CMSG_FIRSTHDR(&msg);
+      c->cmsg_level = SOL_SOCKET;
+      c->cmsg_type = SCM_RIGHTS;
+      c->cmsg_len = CMSG_LEN(sizeof(int));
+      memcpy(CMSG_DATA(c), &fd, sizeof(int));
+    }
+    // MSG_NOSIGNAL: a peer dying mid-handshake must not SIGPIPE-kill us.
+    if (sendmsg(conn, &msg, MSG_NOSIGNAL) != 1) {
+      fprintf(stderr, "[HOOK] WARNING: VMM-IPC fd server sendmsg failed (errno=%d)\n", errno);
+    }
+    if (fd >= 0)
+      close(fd);
+    close(conn);
+  }
+}
+
+static bool vmm_ipc_ensure_server() {
+  std::lock_guard<std::mutex> lock(vmm_ipc_server_mutex);
+  pid_t pid = getpid();
+  if (vmm_ipc_server_pid == pid) {
+    return vmm_ipc_listen_fd >= 0;
+  }
+  // First call in this process, or first after fork (the parent's accept
+  // thread did not survive). Close any inherited listen fd so the parent's
+  // abstract name is not pinned alive by us after the parent exits.
+  if (vmm_ipc_listen_fd >= 0) {
+    close(vmm_ipc_listen_fd);
+    vmm_ipc_listen_fd = -1;
+  }
+  int s = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  struct sockaddr_un addr;
+  socklen_t len = vmm_ipc_socket_addr(pid, &addr);
+  if (s < 0 || bind(s, (struct sockaddr*)&addr, len) != 0 || listen(s, 64) != 0) {
+    fprintf(stderr, "[HOOK] ERROR: VMM-IPC fd server setup failed (errno=%d)\n", errno);
+    if (s >= 0)
+      close(s);
+    vmm_ipc_listen_fd = -1;
+    vmm_ipc_server_pid = pid;  // don't retry-spam; exports in this process fail loudly
+    return false;
+  }
+  // Per-process token (re-derived after fork). /dev/urandom, with a clock^pid
+  // fallback - this is anti-accident (pid reuse), not a security boundary;
+  // same-uid access control is SO_PEERCRED above.
+  uint64_t tok = 0;
+  int ur = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+  if (ur >= 0) {
+    if (read(ur, &tok, sizeof(tok)) != (ssize_t)sizeof(tok))
+      tok = 0;
+    close(ur);
+  }
+  if (tok == 0) {
+    struct timeval tv;
+    gettimeofday(&tv, nullptr);
+    tok = ((uint64_t)tv.tv_sec << 32) ^ (uint64_t)tv.tv_usec ^ ((uint64_t)pid << 16) ^
+          0x9e3779b97f4a7c15ULL;
+  }
+  vmm_ipc_token = tok;
+  vmm_ipc_listen_fd = s;
+  vmm_ipc_server_pid = pid;
+  std::thread(vmm_ipc_server_loop, s).detach();
+  return true;
+}
+
+// Importer side: fetch the fd for `original_ptr` from `exporter_pid`'s server.
+// Returns a live fd in THIS process, or -1.
+static int vmm_ipc_fetch_fd(pid_t exporter_pid, uint64_t token, CUdeviceptr original_ptr) {
+  int s = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  if (s < 0)
+    return -1;
+  vmm_ipc_set_timeouts(s);
+  struct sockaddr_un addr;
+  socklen_t len = vmm_ipc_socket_addr(exporter_pid, &addr);
+  if (connect(s, (struct sockaddr*)&addr, len) != 0) {
+    fprintf(stderr,
+            "[HOOK] ERROR: VMM-IPC connect to exporter pid %d failed (errno=%d) - exporter dead "
+            "or hook version mismatch\n",
+            (int)exporter_pid, errno);
+    close(s);
+    return -1;
+  }
+  VmmIpcRequest req = {(uint64_t)original_ptr, token};
+  if (send(s, &req, sizeof(req), MSG_NOSIGNAL) != (ssize_t)sizeof(req)) {
+    close(s);
+    return -1;
+  }
+  char status = 1;
+  struct iovec iov = {&status, 1};
+  char cbuf[CMSG_SPACE(sizeof(int))] = {};
+  struct msghdr msg = {};
+  msg.msg_iov = &iov;
+  msg.msg_iovlen = 1;
+  msg.msg_control = cbuf;
+  msg.msg_controllen = sizeof(cbuf);
+  ssize_t r = recvmsg(s, &msg, MSG_CMSG_CLOEXEC);
+  close(s);
+  if (r != 1 || status != 0)
+    return -1;
+  for (struct cmsghdr* c = CMSG_FIRSTHDR(&msg); c != nullptr; c = CMSG_NXTHDR(&msg, c)) {
+    if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS) {
+      int fd = -1;
+      memcpy(&fd, CMSG_DATA(c), sizeof(int));
+      return fd;
+    }
+  }
+  return -1;
+}
+
+// Close and forget the parked exported fd for a VA (called from the free
+// path). Without this, the fd keeps the freed allocation's physical pages
+// alive and the server would hand importers a stale mapping.
+static void vmm_ipc_invalidate_export(CUdeviceptr dptr) {
+  vmm_ipc_exported_fds.erase_if(
+      [dptr](const std::pair<const CUdeviceptr, std::pair<CUmemGenericAllocationHandle, int>>& kv) {
+        if (kv.first != dptr)
+          return false;
+        close(kv.second.second);
+        return true;
+      });
+}
 
 // Hook for cuIpcGetMemHandle - intercept Driver API to support VMM allocations
 CUresult cuIpcGetMemHandle(CUipcMemHandle* pHandle, CUdeviceptr dptr) {
@@ -2886,7 +3144,37 @@ CUresult cuIpcGetMemHandle(CUipcMemHandle* pHandle, CUdeviceptr dptr) {
     metadata = kv.second;
   });
 
-  if (found && metadata.handle != 0) {
+  // Decide what to export: the allocation's own handle (SAVE-mode slow-path
+  // allocs), or the whole preallocated chunk plus an offset (LOAD-mode fast
+  // path carves, which have no individual handle). cuMemMap cannot map a
+  // sub-range of an imported handle, so chunk carves are shared by exporting
+  // the chunk handle; the importer maps the entire chunk and returns an
+  // interior pointer.
+  CUmemGenericAllocationHandle export_handle = 0;
+  CUdeviceptr export_key = dptr;  // fd-registry key == blob lookup key
+  uint64_t chunk_base = 0;
+  uint64_t chunk_size = 0;
+  if (found) {
+    export_handle = metadata.handle;
+    if (export_handle == 0 && metadata.from_preallocation) {
+      chunk_base = g_prealloc_base.load();
+      chunk_size = g_prealloc_size.load();
+      export_handle = (CUmemGenericAllocationHandle)g_prealloc_handle.load();
+      export_key = (CUdeviceptr)chunk_base;
+      if (export_handle == 0 || dptr < chunk_base || dptr >= chunk_base + chunk_size) {
+        fprintf(stderr,
+                "[HOOK] ERROR: cuIpcGetMemHandle: carved ptr=0x%llx outside live preallocated "
+                "chunk [0x%llx, +%llu) - cannot export\n",
+                (unsigned long long)dptr, (unsigned long long)chunk_base,
+                (unsigned long long)chunk_size);
+        export_handle = 0;
+        chunk_base = 0;
+        chunk_size = 0;
+      }
+    }
+  }
+
+  if (export_handle != 0) {
     // This is a VMM allocation - export via shareable handle
     typedef CUresult (*cuMemExportToShareableHandle_t)(
         void*, CUmemGenericAllocationHandle, CUmemAllocationHandleType, unsigned long long);
@@ -2898,32 +3186,79 @@ CUresult cuIpcGetMemHandle(CUipcMemHandle* pHandle, CUdeviceptr dptr) {
       return CUDA_ERROR_NOT_SUPPORTED;
     }
 
-    int fd = -1;
-    CUresult result =
-        export_func(&fd, metadata.handle, CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR, 0);
-
-    if (result != CUDA_SUCCESS) {
-      fprintf(stderr,
-              "[HOOK] ERROR: cuMemExportToShareableHandle failed with error %d for ptr=0x%llx\n",
-              result, (unsigned long long)dptr);
-      return result;
+    // The server also owns the per-process token packed into the blob, so it
+    // must exist before we hand out any handle.
+    if (!vmm_ipc_ensure_server()) {
+      return CUDA_ERROR_NOT_SUPPORTED;
     }
 
-    // Pack our custom data into the handle structure
-    // CUipcMemHandle has 64 reserved bytes - we use them to store our info:
-    // - Magic marker (4 bytes) to identify VMM handles
-    // - File descriptor (4 bytes)
-    // - Original pointer address (8 bytes) - critical for CUDA graph replay!
-    // - Size (8 bytes)
+    // Export once per allocation and park the fd for the server thread.
+    // The cached entry is keyed by VA and validated against the allocation
+    // handle, so VA reuse after free/realloc re-exports instead of serving a
+    // stale fd (the free path also eagerly invalidates via
+    // vmm_ipc_invalidate_export).
+    int fd = -1;
+    vmm_ipc_exported_fds.visit(
+        export_key,
+        [&](const std::pair<const CUdeviceptr, std::pair<CUmemGenericAllocationHandle, int>>& kv) {
+          if (kv.second.first == export_handle)
+            fd = kv.second.second;
+        });
+    if (fd < 0) {
+      int new_fd = -1;
+      CUresult result =
+          export_func(&new_fd, export_handle, CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR, 0);
+      if (result != CUDA_SUCCESS) {
+        fprintf(stderr,
+                "[HOOK] ERROR: cuMemExportToShareableHandle failed with error %d for ptr=0x%llx\n",
+                result, (unsigned long long)dptr);
+        return result;
+      }
+      // Parked fds must not leak into forked children (each inherited copy
+      // pins the allocation's physical memory). SCM_RIGHTS transfer is
+      // unaffected by CLOEXEC.
+      fcntl(new_fd, F_SETFD, FD_CLOEXEC);
+      vmm_ipc_exported_fds.insert_or_visit(
+          std::make_pair(export_key, std::make_pair(export_handle, new_fd)),
+          [&](std::pair<const CUdeviceptr, std::pair<CUmemGenericAllocationHandle, int>>& kv) {
+            // Entry exists: either a racing thread won (same handle - drop
+            // ours) or it is stale from a freed allocation (replace).
+            if (kv.second.first == export_handle) {
+              close(new_fd);
+              new_fd = kv.second.second;
+            } else {
+              close(kv.second.second);
+              kv.second = std::make_pair(export_handle, new_fd);
+            }
+          });
+      fd = new_fd;
+    }
+
+    // Pack our custom data into the handle structure.
+    // CUipcMemHandle has 64 reserved bytes:
+    // - Magic marker (4 bytes, "VMM2")
+    // - Exporter pid (4 bytes) - importer fetches the fd from this process's
+    //   VMM-IPC socket via SCM_RIGHTS (a raw fd integer is not portable)
+    // - Original pointer address (8 bytes) - fd lookup key + placement hint
+    // - Aligned size (8 bytes)
+    // - Per-process token (8 bytes) - server rejects mismatches (pid reuse)
+    // - Chunk base + chunk size (8+8 bytes) - nonzero iff the pointer is a
+    //   carve from the preallocated chunk; the importer then maps the whole
+    //   chunk and returns base + (ptr - chunk_base)
     memset(pHandle, 0, sizeof(CUipcMemHandle));
 
+    uint32_t pid_u32 = (uint32_t)getpid();
     memcpy(pHandle->reserved, &VMM_IPC_MAGIC, sizeof(uint32_t));
-    memcpy(pHandle->reserved + 4, &fd, sizeof(int));
+    memcpy(pHandle->reserved + 4, &pid_u32, sizeof(uint32_t));
     memcpy(pHandle->reserved + 8, &dptr, sizeof(CUdeviceptr));
     memcpy(pHandle->reserved + 16, &metadata.size, sizeof(size_t));
+    memcpy(pHandle->reserved + 24, &vmm_ipc_token, sizeof(uint64_t));
+    memcpy(pHandle->reserved + 32, &chunk_base, sizeof(uint64_t));
+    memcpy(pHandle->reserved + 40, &chunk_size, sizeof(uint64_t));
 
 #ifdef HOOK_DEBUG
-    fprintf(stderr, "[HOOK] cuIpcGetMemHandle: VMM ptr=0x%llx, fd=%d, size=%zu\n",
+    fprintf(stderr,
+            "[HOOK] cuIpcGetMemHandle: VMM ptr=0x%llx, fd=%d (served via socket), size=%zu\n",
             (unsigned long long)dptr, fd, metadata.size);
 #endif
     return CUDA_SUCCESS;
@@ -2948,18 +3283,60 @@ CUresult cuIpcOpenMemHandle(CUdeviceptr* pdptr, CUipcMemHandle handle, unsigned 
 
   if (magic == VMM_IPC_MAGIC) {
     // This is a VMM IPC handle - extract the packed data
-    int fd;
+    uint32_t exporter_pid_u32;
     CUdeviceptr original_ptr;
     size_t size;
+    uint64_t token;
+    uint64_t chunk_base;
+    uint64_t chunk_size;
 
-    memcpy(&fd, handle.reserved + 4, sizeof(int));
+    memcpy(&exporter_pid_u32, handle.reserved + 4, sizeof(uint32_t));
     memcpy(&original_ptr, handle.reserved + 8, sizeof(CUdeviceptr));
     memcpy(&size, handle.reserved + 16, sizeof(size_t));
+    memcpy(&token, handle.reserved + 24, sizeof(uint64_t));
+    memcpy(&chunk_base, handle.reserved + 32, sizeof(uint64_t));
+    memcpy(&chunk_size, handle.reserved + 40, sizeof(uint64_t));
+    pid_t exporter_pid = (pid_t)exporter_pid_u32;
+    // For chunk carves the fd registry on the exporter is keyed by the chunk
+    // base, and what we import/map is the whole chunk.
+    CUdeviceptr fetch_key = (chunk_base != 0) ? (CUdeviceptr)chunk_base : original_ptr;
+    size_t map_size = (chunk_base != 0) ? (size_t)chunk_size : size;
+
+    if (chunk_base != 0) {
+      // Fast path: peer chunk already mapped -> hand out an interior pointer.
+      std::lock_guard<std::mutex> lock(vmm_ipc_chunk_mutex);
+      auto it = vmm_ipc_chunk_mappings.find({exporter_pid, chunk_base});
+      if (it != vmm_ipc_chunk_mappings.end()) {
+        it->second.refcount++;
+        CUdeviceptr mapped = it->second.local_base + (original_ptr - (CUdeviceptr)chunk_base);
+        vmm_ipc_chunk_subptrs[mapped] = {exporter_pid, chunk_base};
+        *pdptr = mapped;
+        return CUDA_SUCCESS;
+      }
+    }
 
 #ifdef HOOK_DEBUG
-    fprintf(stderr, "[HOOK] cuIpcOpenMemHandle: VMM fd=%d, original_ptr=0x%llx, size=%zu\n", fd,
-            (unsigned long long)original_ptr, size);
+    fprintf(stderr,
+            "[HOOK] cuIpcOpenMemHandle: VMM exporter_pid=%d, original_ptr=0x%llx, size=%zu\n",
+            (int)exporter_pid, (unsigned long long)original_ptr, size);
 #endif
+
+    // Obtain a live fd in THIS process: dup from our own registry for
+    // same-process opens, SCM_RIGHTS fetch from the exporter otherwise.
+    int fd = -1;
+    if (exporter_pid == getpid() && token == vmm_ipc_token) {
+      vmm_ipc_exported_fds.visit(
+          fetch_key,
+          [&](const std::pair<const CUdeviceptr, std::pair<CUmemGenericAllocationHandle, int>>&
+                  kv) { fd = fcntl(kv.second.second, F_DUPFD_CLOEXEC, 0); });
+    } else {
+      fd = vmm_ipc_fetch_fd(exporter_pid, token, fetch_key);
+    }
+    if (fd < 0) {
+      fprintf(stderr, "[HOOK] ERROR: VMM-IPC could not obtain fd for ptr=0x%llx from pid %d\n",
+              (unsigned long long)fetch_key, (int)exporter_pid);
+      return CUDA_ERROR_INVALID_VALUE;
+    }
 
     // Import the allocation handle from file descriptor
     typedef CUresult (*cuMemImportFromShareableHandle_t)(CUmemGenericAllocationHandle*, void*,
@@ -2969,12 +3346,14 @@ CUresult cuIpcOpenMemHandle(CUdeviceptr* pdptr, CUipcMemHandle handle, unsigned 
 
     if (import_func == nullptr) {
       fprintf(stderr, "[HOOK] ERROR: cuMemImportFromShareableHandle not found\n");
+      close(fd);
       return CUDA_ERROR_NOT_SUPPORTED;
     }
 
     CUmemGenericAllocationHandle imported_handle;
     CUresult result = import_func(&imported_handle, (void*)(intptr_t)fd,
                                   CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR);
+    close(fd);  // the driver does not take ownership of our fd copy
 
     if (result != CUDA_SUCCESS) {
       fprintf(stderr, "[HOOK] ERROR: cuMemImportFromShareableHandle failed with error %d\n",
@@ -2982,16 +3361,58 @@ CUresult cuIpcOpenMemHandle(CUdeviceptr* pdptr, CUipcMemHandle handle, unsigned 
       return result;
     }
 
-    // Map to the SAME address as original (critical for CUDA graph replay!)
+    typedef CUresult (*cuMemAddressReserve_t)(CUdeviceptr*, size_t, size_t, CUdeviceptr,
+                                              unsigned long long);
+    auto real_reserve_func = (cuMemAddressReserve_t)CUDA_DRIVER_CALL(
+        cuda_driver_entry_table, CUDA_ENTRY_cuMemAddressReserve);
+    typedef CUresult (*cuMemRelease_t)(CUmemGenericAllocationHandle);
+    auto mem_release_func =
+        (cuMemRelease_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuMemRelease);
+    typedef CUresult (*cuMemAddressFree_t)(CUdeviceptr, size_t);
+    auto real_address_free_func =
+        (cuMemAddressFree_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuMemAddressFree);
+
+    // Reserve our own VA range for the peer mapping (real driver call, NOT the
+    // hooked wrapper - peer imports must never advance the deterministic
+    // cursor). The exporter's VA is passed as a hint: with per-rank disjoint
+    // regions it is honored and the mapping is address-stable; with today's
+    // shared-base symmetric layouts that range is occupied by our own region
+    // reservation, the driver picks elsewhere, and the caller gets a valid but
+    // relocated peer pointer. That is correct for table-indirect consumers
+    // (DeepEP buffer_ptrs_gpu, custom-allreduce RankData contents): peer VAs
+    // are never baked into captured graph nodes on those paths.
+    // First preference: the exporter's own VA (address-stable whenever it is
+    // locally free, e.g. future per-rank disjoint-base configs).
+    CUdeviceptr mapped_ptr = 0;
+    result = real_reserve_func(&mapped_ptr, map_size, 0, fetch_key, 0);
+    if (result == CUDA_SUCCESS && mapped_ptr != fetch_key) {
+      // Hint not honored. Do NOT keep the driver's fallback choice - it tends
+      // to sit immediately after existing reservations, i.e. on the NVSHMEM
+      // heap hint. Re-reserve inside the dedicated import zone.
+      real_address_free_func(mapped_ptr, map_size);
+      uint64_t zone_hint =
+          vmm_ipc_import_hint.fetch_add((map_size + ((1ULL << 30) - 1)) & ~((1ULL << 30) - 1));
+      mapped_ptr = 0;
+      result = real_reserve_func(&mapped_ptr, map_size, 0, (CUdeviceptr)zone_hint, 0);
+    }
+    if (result != CUDA_SUCCESS) {
+      fprintf(stderr, "[HOOK] ERROR: cuMemAddressReserve for IPC import failed with error %d\n",
+              result);
+      mem_release_func(imported_handle);
+      return result;
+    }
+
     typedef CUresult (*cuMemMap_t)(CUdeviceptr, size_t, size_t, CUmemGenericAllocationHandle,
                                    unsigned long long);
     auto map_func = (cuMemMap_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuMemMap);
 
-    result = map_func(original_ptr, size, 0, imported_handle, 0);
+    result = map_func(mapped_ptr, map_size, 0, imported_handle, 0);
     if (result != CUDA_SUCCESS) {
       fprintf(stderr,
               "[HOOK] ERROR: cuMemMap for IPC failed with error %d at addr=0x%llx size=%zu\n",
-              result, (unsigned long long)original_ptr, size);
+              result, (unsigned long long)mapped_ptr, map_size);
+      real_address_free_func(mapped_ptr, map_size);
+      mem_release_func(imported_handle);
       return result;
     }
 
@@ -3011,27 +3432,67 @@ CUresult cuIpcOpenMemHandle(CUdeviceptr* pdptr, CUipcMemHandle handle, unsigned 
     auto set_access_func =
         (cuMemSetAccess_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuMemSetAccess);
 
-    result = set_access_func(original_ptr, size, &accessDesc, 1);
+    result = set_access_func(mapped_ptr, map_size, &accessDesc, 1);
     if (result != CUDA_SUCCESS) {
       fprintf(stderr, "[HOOK] ERROR: cuMemSetAccess for IPC failed with error %d\n", result);
+      typedef CUresult (*cuMemUnmap_t)(CUdeviceptr, size_t);
+      auto mem_unmap_func =
+          (cuMemUnmap_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuMemUnmap);
+      mem_unmap_func(mapped_ptr, map_size);
+      real_address_free_func(mapped_ptr, map_size);
+      mem_release_func(imported_handle);
       return result;
     }
 
-    *pdptr = original_ptr;
+    if (mapped_ptr != fetch_key) {
+      fprintf(stderr,
+              "[HOOK] INFO: VMM-IPC import relocated: exporter VA 0x%llx -> local VA 0x%llx "
+              "(expected with shared region bases; peer tables must be refreshed by the caller)\n",
+              (unsigned long long)fetch_key, (unsigned long long)mapped_ptr);
+    }
 
-    // Track this imported allocation
+    if (chunk_base != 0) {
+      // Register the whole-chunk mapping and hand out the interior pointer.
+      CUdeviceptr interior = mapped_ptr + (original_ptr - (CUdeviceptr)chunk_base);
+      std::lock_guard<std::mutex> lock(vmm_ipc_chunk_mutex);
+      auto key = std::make_pair(exporter_pid, chunk_base);
+      auto it = vmm_ipc_chunk_mappings.find(key);
+      if (it != vmm_ipc_chunk_mappings.end()) {
+        // Lost a race to a concurrent open of the same peer chunk: keep the
+        // winner's mapping, drop ours.
+        typedef CUresult (*cuMemUnmap_t)(CUdeviceptr, size_t);
+        auto mem_unmap_func =
+            (cuMemUnmap_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuMemUnmap);
+        mem_unmap_func(mapped_ptr, map_size);
+        real_address_free_func(mapped_ptr, map_size);
+        mem_release_func(imported_handle);
+        it->second.refcount++;
+        interior = it->second.local_base + (original_ptr - (CUdeviceptr)chunk_base);
+      } else {
+        vmm_ipc_chunk_mappings[key] = VmmIpcChunkMapping{mapped_ptr, map_size, imported_handle, 1};
+      }
+      vmm_ipc_chunk_subptrs[interior] = key;
+      *pdptr = interior;
+      return CUDA_SUCCESS;
+    }
+
+    *pdptr = mapped_ptr;
+
+    // Track this imported allocation (close path unmaps, releases, and frees
+    // the reservation we created above)
     AllocMetadata alloc_metadata;
-    alloc_metadata.ptr = original_ptr;
+    alloc_metadata.ptr = mapped_ptr;
     alloc_metadata.size = size;
     alloc_metadata.handle = imported_handle;
     alloc_metadata.region_base = 0;  // region_base == 0 indicates IPC-imported
     alloc_metadata.from_preallocation = false;
-    global_alloc_metadata.emplace(original_ptr, alloc_metadata);
+    global_alloc_metadata.emplace(mapped_ptr, alloc_metadata);
 
 #ifdef HOOK_DEBUG
     fprintf(stderr,
-            "[HOOK] cuIpcOpenMemHandle: Successfully mapped VMM fd=%d -> ptr=0x%llx, size=%zu\n",
-            fd, (unsigned long long)*pdptr, size);
+            "[HOOK] cuIpcOpenMemHandle: Successfully mapped exporter ptr=0x%llx -> ptr=0x%llx, "
+            "size=%zu\n",
+            (unsigned long long)original_ptr, (unsigned long long)*pdptr, size);
 #endif
     return CUDA_SUCCESS;
   }
@@ -3048,6 +3509,34 @@ CUresult cuIpcCloseMemHandle(CUdeviceptr dptr) {
   typedef CUresult (*cuIpcCloseMemHandle_t)(CUdeviceptr);
   auto real_func = (cuIpcCloseMemHandle_t)CUDA_DRIVER_CALL(cuda_driver_entry_table,
                                                            CUDA_ENTRY_cuIpcCloseMemHandle);
+
+  // Interior pointer into an imported peer chunk? Refcounted: the chunk
+  // mapping is torn down when its last interior pointer closes.
+  {
+    std::lock_guard<std::mutex> lock(vmm_ipc_chunk_mutex);
+    auto sub_it = vmm_ipc_chunk_subptrs.find(dptr);
+    if (sub_it != vmm_ipc_chunk_subptrs.end()) {
+      auto key = sub_it->second;
+      vmm_ipc_chunk_subptrs.erase(sub_it);
+      auto it = vmm_ipc_chunk_mappings.find(key);
+      if (it != vmm_ipc_chunk_mappings.end() && --it->second.refcount == 0) {
+        typedef CUresult (*cuMemUnmap_t)(CUdeviceptr, size_t);
+        auto mem_unmap_func =
+            (cuMemUnmap_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuMemUnmap);
+        typedef CUresult (*cuMemRelease_t)(CUmemGenericAllocationHandle);
+        auto mem_release_func =
+            (cuMemRelease_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuMemRelease);
+        typedef CUresult (*cuMemAddressFree_t)(CUdeviceptr, size_t);
+        auto addr_free_func = (cuMemAddressFree_t)CUDA_DRIVER_CALL(cuda_driver_entry_table,
+                                                                   CUDA_ENTRY_cuMemAddressFree);
+        mem_unmap_func(it->second.local_base, it->second.size);
+        mem_release_func(it->second.handle);
+        addr_free_func(it->second.local_base, it->second.size);
+        vmm_ipc_chunk_mappings.erase(it);
+      }
+      return CUDA_SUCCESS;
+    }
+  }
 
   AllocMetadata metadata;
   bool found = false;
@@ -3067,8 +3556,14 @@ CUresult cuIpcCloseMemHandle(CUdeviceptr dptr) {
     auto mem_release_func =
         (cuMemRelease_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuMemRelease);
 
+    typedef CUresult (*cuMemAddressFree_t)(CUdeviceptr, size_t);
+    auto real_address_free_func =
+        (cuMemAddressFree_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuMemAddressFree);
+
     mem_unmap_func(dptr, metadata.size);
     mem_release_func(metadata.handle);
+    // The import path owns a dedicated VA reservation for this mapping.
+    real_address_free_func(dptr, metadata.size);
 
     global_alloc_metadata.erase_if(
         [dptr](const std::pair<const CUdeviceptr, AllocMetadata>& kv) { return kv.first == dptr; });
@@ -3343,6 +3838,9 @@ bool preallocate_region(size_t size) {
   tls_storage.preallocated_start_addr = target_addr;
   tls_storage.preallocated_end_addr = target_addr + aligned_size;
   tls_storage.has_preallocation = true;
+  g_prealloc_handle.store((unsigned long long)allocHandle);
+  g_prealloc_base.store((uint64_t)target_addr);
+  g_prealloc_size.store((uint64_t)aligned_size);
 
   // Note: we do NOT advance current_alloc_base_addr here.
   // The alloc calls will advance it as they consume the preallocated memory.
@@ -3367,6 +3865,11 @@ void free_preallocated_region() {
 
   mem_unmap_func(tls_storage.preallocated_start_addr, preallocated_size);
   mem_release_func(tls_storage.preallocated_handle);
+
+  vmm_ipc_invalidate_export((CUdeviceptr)tls_storage.preallocated_start_addr);
+  g_prealloc_handle.store(0);
+  g_prealloc_base.store(0);
+  g_prealloc_size.store(0);
 
   tls_storage.preallocated_handle = 0;
   tls_storage.preallocated_start_addr = 0;
