@@ -55,6 +55,8 @@ class CompilationConfig:
 
 This is the earliest activation point in the parent process. As soon as a `CompilationConfig` is fully constructed, foundry's runtime patches are in place.
 
+> Note: vLLM folds `graph_extension_config_path` into `CompilationConfig.compute_hash()` (the torch.compile cache key) even though it never affects codegen. This is harmless **as long as every SAVE/LOAD phase passes the same path string** — run all phases from one canonical CWD (or always an absolute path). If pass 1 and pass 2 see the path via different mount aliases (`/home/...` vs `/data/...`), pass 2 misses pass 1's warm cache and inductor recompiles inside the cuda-graph capture window → `cudaErrorStreamCaptureInvalidated`. We keep vLLM unpatched and rely on consistent invocation instead; the EP recipe scripts are launched from the workspace root. (An optional `ignored_factors` exclusion would harden this at the source but is not applied.)
+
 ## 3. `vllm/v1/engine/core.py` (~6 lines)
 
 ```python
