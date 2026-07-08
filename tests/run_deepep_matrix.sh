@@ -24,7 +24,7 @@ HOOK_SO=$($PY -c "import foundry.ops, pathlib; print(pathlib.Path(foundry.ops.__
 CASE=${1:?usage: run_deepep_matrix.sh <case> <save|load|both>}
 PHASE=${2:?usage: run_deepep_matrix.sh <case> <save|load|both>}
 
-export CUDA_VISIBLE_DEVICES=0,1
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1}
 # Pin NVSHMEM heap chunks to POSIX FD handles — explicit "no fabric handles anywhere".
 # (Auto-detect picks FD on non-MNNVL machines anyway; pinning removes the variable.)
 export NVSHMEM_CUMEM_HANDLE_TYPE=FILE_DESCRIPTOR
@@ -42,7 +42,8 @@ case "$CASE" in
 esac
 
 # GPUs are shared with other users — refuse to run without headroom.
-for i in 0 1; do
+# Check exactly the GPUs we'll run on (CUDA_VISIBLE_DEVICES), not a hardcoded 0,1.
+for i in ${CUDA_VISIBLE_DEVICES//,/ }; do
   free=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits -i $i)
   if [ "$free" -lt 6000 ]; then
     echo "GPU $i has only ${free} MiB free — aborting (need ~6 GB headroom)"; exit 3

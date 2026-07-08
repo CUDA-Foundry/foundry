@@ -22,14 +22,14 @@ if [[ "$2" == "--save" ]]; then
     export NCCL_CUMEM_ENABLE=0
     export NCCL_NVLS_ENABLE=0
     export VLLM_USE_V2_MODEL_RUNNER=0
-    export FOUNDRY_DEEPEP_NVL_IPC=1
+    export FOUNDRY_DEEPEP_NVL_IPC="${FOUNDRY_DEEPEP_NVL_IPC:-1}"
     echo "Using foundry SAVE (FP8/DeepGEMM, DeepEP NVL/IPC): ${SCRIPT_DIR}/foundry_save_fp8.toml"
 elif [[ "$2" == "--load" ]]; then
     FOUNDRY_ARGS+=( --compilation-config.graph_extension_config_path "${SCRIPT_DIR}/foundry_load_fp8.toml" )
     export NCCL_CUMEM_ENABLE=0
     export NCCL_NVLS_ENABLE=0
     export VLLM_USE_V2_MODEL_RUNNER=0
-    export FOUNDRY_DEEPEP_NVL_IPC=1
+    export FOUNDRY_DEEPEP_NVL_IPC="${FOUNDRY_DEEPEP_NVL_IPC:-1}"
     echo "Using foundry LOAD (FP8/DeepGEMM, DeepEP NVL/IPC): ${SCRIPT_DIR}/foundry_load_fp8.toml"
 elif [[ -n "$2" ]]; then
     echo "Usage: $0 <ep_size> [--save|--load]"
@@ -41,8 +41,9 @@ fi
 export VLLM_USE_V2_MODEL_RUNNER=0
 export VLLM_USE_FLASHINFER_SAMPLER=1
 export VLLM_DISABLE_SHARED_EXPERTS_STREAM=1
-# FP8 blockscale MoE via DeepGEMM.
-export VLLM_USE_DEEP_GEMM=1
+# DeepGEMM is auto-selected by vLLM for FP8 blockscale MoE — no need to set it
+# (matches recipe/vllm/serve_qwen3-30ba3bfp8_ep.sh). To ablate, export
+# VLLM_USE_DEEP_GEMM=0 before invoking (forces CutlassFp8BlockScaledMMKernel).
 
 CUDAGRAPH_CAPTURE_SIZES=($(seq 1 256))
 

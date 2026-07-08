@@ -2955,14 +2955,18 @@ static std::map<std::pair<pid_t, uint64_t>, VmmIpcChunkMapping> vmm_ipc_chunk_ma
 // interior pointer handed to a caller -> owning chunk key (for close)
 static std::map<CUdeviceptr, std::pair<pid_t, uint64_t>> vmm_ipc_chunk_subptrs;
 
-// Dedicated VA zone for relocated peer imports, far below the foundry region
-// (default 0x600000000000) and the large-reserve zone right above region end.
-// Without this, the driver tends to place a relocated import immediately
-// after the region reservation - exactly where the hooked large-reserve hint
-// sends the NVSHMEM symmetric heap next, which silently breaks the heap's
-// SAVE/LOAD address determinism (observed: heap displaced by a peer-chunk
-// import landing at region_end).
-static std::atomic<uint64_t> vmm_ipc_import_hint{0x300000000000ULL};
+// Dedicated VA zone for relocated peer imports. Placed ABOVE the foundry region
+// (0x600000000000 + region_size) and the NVSHMEM symmetric-heap large-reserve
+// zone (which grows up from region_end), so peer-chunk imports can never share
+// or fragment the VA NVSHMEM uses for its symmetric heap + peer-heap P2P
+// mappings. The earlier 0x300000000000 (below the region) raced with NVSHMEM's
+// driver-placed peer-heap mappings: on LOAD the whole-chunk import (~region
+// size) consumed far more of that zone than the per-alloc import on SAVE, so
+// NVSHMEM's peer_heap_base_p2p[] would non-deterministically land on garbage,
+// MMU-faulting the FP8 DeepEP dispatch (which writes peers via that base).
+// 0x700000000000 = 112 TiB: clear of the region (~96-100 TiB) and the NVSHMEM
+// heap, and within the GPU's 49-bit VA space.
+static std::atomic<uint64_t> vmm_ipc_import_hint{0x700000000000ULL};
 
 static socklen_t vmm_ipc_socket_addr(pid_t pid, struct sockaddr_un* addr) {
   memset(addr, 0, sizeof(*addr));
@@ -3381,19 +3385,52 @@ CUresult cuIpcOpenMemHandle(CUdeviceptr* pdptr, CUipcMemHandle handle, unsigned 
     // relocated peer pointer. That is correct for table-indirect consumers
     // (DeepEP buffer_ptrs_gpu, custom-allreduce RankData contents): peer VAs
     // are never baked into captured graph nodes on those paths.
-    // First preference: the exporter's own VA (address-stable whenever it is
-    // locally free, e.g. future per-rank disjoint-base configs).
+    // Decide whether the exporter's own VA (fetch_key) is usable as the mapping
+    // address. It is only free in this process under future per-rank disjoint
+    // bases; with today's shared base, fetch_key lands inside our OWN region
+    // reservation, so attempting it just churns the driver (reserve elsewhere ->
+    // free) and that churn can interleave with NVSHMEM's symmetric-heap
+    // reservations -> non-deterministic garbage peer_heap_base_p2p. Skip the
+    // attempt whenever fetch_key is inside our region; go straight to the
+    // dedicated high import zone, which is disjoint from the region AND the
+    // NVSHMEM heap (see vmm_ipc_import_hint).
     CUdeviceptr mapped_ptr = 0;
-    result = real_reserve_func(&mapped_ptr, map_size, 0, fetch_key, 0);
-    if (result == CUDA_SUCCESS && mapped_ptr != fetch_key) {
-      // Hint not honored. Do NOT keep the driver's fallback choice - it tends
-      // to sit immediately after existing reservations, i.e. on the NVSHMEM
-      // heap hint. Re-reserve inside the dedicated import zone.
-      real_address_free_func(mapped_ptr, map_size);
-      uint64_t zone_hint =
-          vmm_ipc_import_hint.fetch_add((map_size + ((1ULL << 30) - 1)) & ~((1ULL << 30) - 1));
+    bool fetch_key_in_region =
+        tls_storage.region_initialized &&
+        (uint64_t)fetch_key >= (uint64_t)tls_storage.region.base &&
+        (uint64_t)fetch_key < (uint64_t)tls_storage.region.base + tls_storage.region.size;
+    if (!fetch_key_in_region) {
+      result = real_reserve_func(&mapped_ptr, map_size, 0, fetch_key, 0);
+      if (result == CUDA_SUCCESS && mapped_ptr != fetch_key) {
+        real_address_free_func(mapped_ptr, map_size);
+        result = CUDA_ERROR_INVALID_VALUE;  // force the import-zone path below
+      }
+    } else {
+      result = CUDA_ERROR_INVALID_VALUE;  // force the import-zone path below
+    }
+    if (result != CUDA_SUCCESS) {
+      // Reserve in the dedicated high import zone. Strict: if the hint is not
+      // honored, free the driver's fallback and fail rather than keep a VA that
+      // could sit on NVSHMEM's heap.
+      uint64_t aligned = (map_size + ((1ULL << 30) - 1)) & ~((1ULL << 30) - 1);
+      uint64_t zone_hint = vmm_ipc_import_hint.fetch_add(aligned);
       mapped_ptr = 0;
       result = real_reserve_func(&mapped_ptr, map_size, 0, (CUdeviceptr)zone_hint, 0);
+      if (result == CUDA_SUCCESS && mapped_ptr != (CUdeviceptr)zone_hint) {
+        fprintf(stderr,
+                "[HOOK] WARNING: VMM-IPC import zone hint 0x%llx not honored (got 0x%llx); "
+                "retrying higher\n",
+                (unsigned long long)zone_hint, (unsigned long long)mapped_ptr);
+        real_address_free_func(mapped_ptr, map_size);
+        zone_hint = vmm_ipc_import_hint.fetch_add(aligned);
+        mapped_ptr = 0;
+        result = real_reserve_func(&mapped_ptr, map_size, 0, (CUdeviceptr)zone_hint, 0);
+      }
+      fprintf(stderr,
+              "[HOOK] INFO: VMM-IPC import reserve: fetch_key=0x%llx in_region=%d map_size=0x%llx "
+              "-> mapped_ptr=0x%llx (zone)\n",
+              (unsigned long long)fetch_key, (int)fetch_key_in_region, (unsigned long long)map_size,
+              (unsigned long long)mapped_ptr);
     }
     if (result != CUDA_SUCCESS) {
       fprintf(stderr, "[HOOK] ERROR: cuMemAddressReserve for IPC import failed with error %d\n",
