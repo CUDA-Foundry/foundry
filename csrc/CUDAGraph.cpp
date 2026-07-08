@@ -1527,16 +1527,24 @@ GraphLoadResult CUDAGraph::load(const std::string& json_path, MempoolId_t pool) 
     TORCH_INTERNAL_ASSERT(graph->mempool_id_.first > 0);
   }
 
-  const json::array& generators_array = root.at("generators").as_array();
-  for (const auto& gen_val : generators_array) {
-    const json::object& gen_obj = gen_val.as_object();
-    uint64_t state_id = gen_obj.at("id").to_number<uint64_t>();
-    uint64_t seed = gen_obj.at("seed").to_number<uint64_t>();
-    uint64_t wholegraph_increment = gen_obj.at("wholegraph_increment").to_number<uint64_t>();
+  {
+    // Suspend the tracked region: the first register_graph lazily
+    // allocates seed/offset_extragraph_ (see finish_one_graph_load_impl
+    // in CUDAGraphParallel.cpp for the full rationale); in-region pool
+    // growth here would push the VMM cursor past the recorded
+    // start_base_addr and abort the replay below.
+    foundry::SuspendAllocationRegion suspend_region;
+    const json::array& generators_array = root.at("generators").as_array();
+    for (const auto& gen_val : generators_array) {
+      const json::object& gen_obj = gen_val.as_object();
+      uint64_t state_id = gen_obj.at("id").to_number<uint64_t>();
+      uint64_t seed = gen_obj.at("seed").to_number<uint64_t>();
+      uint64_t wholegraph_increment = gen_obj.at("wholegraph_increment").to_number<uint64_t>();
 
-    auto state = global_generator_state_registry.get_state_from_id(state_id, seed);
-    state->register_graph(reinterpret_cast<at::cuda::CUDAGraph*>(graph.get()));
-    graph->captured_generator_states_[state] = wholegraph_increment;
+      auto state = global_generator_state_registry.get_state_from_id(state_id, seed);
+      state->register_graph(reinterpret_cast<at::cuda::CUDAGraph*>(graph.get()));
+      graph->captured_generator_states_[state] = wholegraph_increment;
+    }
   }
 
   const json::object& allocator_events = root.at("allocator_events").as_object();

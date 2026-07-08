@@ -27,6 +27,30 @@ namespace foundry {
 void set_allocation_region(void* base, size_t size);
 void stop_allocation_region();
 void resume_allocation_region();
+bool allocation_region_enabled();
+
+// RAII: temporarily route allocations to the ordinary CUDA allocator
+// instead of the tracked VMM region (no cursor movement). Restores the
+// prior enabled state, so it nests safely and is a no-op when no region
+// is active on the calling thread.
+class SuspendAllocationRegion {
+ public:
+  SuspendAllocationRegion() : was_enabled_(allocation_region_enabled()) {
+    if (was_enabled_) {
+      stop_allocation_region();
+    }
+  }
+  ~SuspendAllocationRegion() {
+    if (was_enabled_) {
+      resume_allocation_region();
+    }
+  }
+  SuspendAllocationRegion(const SuspendAllocationRegion&) = delete;
+  SuspendAllocationRegion& operator=(const SuspendAllocationRegion&) = delete;
+
+ private:
+  bool was_enabled_;
+};
 bool preallocate_region(size_t size);
 void free_preallocated_region();
 size_t get_current_alloc_offset();

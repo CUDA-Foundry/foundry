@@ -2047,7 +2047,20 @@ GraphLoadResult finish_one_graph_load_impl(std::shared_ptr<PendingGraphLoads> pe
 
   // Register deferred generators (before allocator replay to match
   // SAVE mode timing where generators are created before graph capture).
+  //
+  // The first registration lazily creates the generator state's
+  // seed/offset_extragraph_ tensors (two at::empty in
+  // CUDAGeneratorState::register_graph). Whether that at::empty grows a
+  // fresh caching-allocator segment depends on the free-pool state, which
+  // is NOT mirrored between SAVE and LOAD (SAVE's lazy init fires inside
+  // capture_begin, before the start_base_addr snapshot). If the growth
+  // happened inside the tracked region here, the VMM cursor would move
+  // past the recorded start_base_addr and replay_hook_events_from_json
+  // below would abort ("Memory offset mismatch during replay", observed
+  // as a 2 MB drift on A100). Suspend the region so any segment growth
+  // lands outside the tracked cursor.
   if (pending->registry && !entry.generators_meta.is_null()) {
+    foundry::SuspendAllocationRegion suspend_region;
     const boost::json::array& gen_array = entry.generators_meta.as_array();
     for (const auto& gen_val : gen_array) {
       const boost::json::object& gen_obj = gen_val.as_object();
