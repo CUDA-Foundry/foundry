@@ -2691,6 +2691,14 @@ CUresult cuMemAddressReserve(CUdeviceptr* ptr, size_t size, size_t alignment, CU
     return real_func(ptr, size, alignment, addr, flags);
   }
 
+  // CUDA semantics: alignment == 0 requests the default alignment (torch's
+  // symmetric-memory allocator passes 0). align_to(x, 0) computes
+  // (x-1) & ~(size_t)-1 == 0, which would carve VA 0x0 and rewind the region
+  // cursor — normalize to the allocation granularity instead.
+  if (alignment == 0) {
+    alignment = kAllocAlignment;
+  }
+
   if (addr != 0) {
     CUresult result = real_func(ptr, size, alignment, addr, flags);
 #ifdef HOOK_DEBUG
@@ -3117,6 +3125,26 @@ void set_allocation_region(void* base, size_t size) {
         stderr,
         "[HOOK] ERROR: Reserved address %llu != requested base %p, disabling allocation region\n",
         (unsigned long long)reserved_ptr, (void*)aligned_base);
+
+    // Diagnostic: print the /proc/self/maps entries overlapping the requested
+    // range so the squatting mapping is identifiable (pid included since
+    // [HOOK] stderr lines carry no process prefix).
+    {
+      FILE* maps = fopen("/proc/self/maps", "r");
+      if (maps) {
+        char line[512];
+        uintptr_t want_lo = (uintptr_t)aligned_base, want_hi = (uintptr_t)aligned_base + size;
+        fprintf(stderr, "[HOOK] DIAG(pid %d): mappings overlapping [%p, %p):\n", (int)getpid(),
+                (void*)want_lo, (void*)want_hi);
+        while (fgets(line, sizeof(line), maps)) {
+          uintptr_t lo = 0, hi = 0;
+          if (sscanf(line, "%lx-%lx", &lo, &hi) == 2 && lo < want_hi && hi > want_lo) {
+            fprintf(stderr, "[HOOK] DIAG(pid %d):   %s", (int)getpid(), line);
+          }
+        }
+        fclose(maps);
+      }
+    }
 
     typedef CUresult (*cuMemAddressFree_t)(CUdeviceptr, size_t);
     auto free_func =
