@@ -271,13 +271,18 @@ def preallocate_for_load_mode() -> None:
 
 def _preallocate_attention_workspaces(metadata_builders: list | None) -> None:
     try:
-        from vllm.v1.attention.backends.flashinfer import (
-            FlashInferMetadataBuilder,
-            _get_trtllm_gen_workspace_buffer,
-        )
+        from vllm.v1.attention.backends import flashinfer as fi
+
+        FlashInferMetadataBuilder = fi.FlashInferMetadataBuilder
     except ImportError:
         return
-    _get_trtllm_gen_workspace_buffer()
+    # Renamed upstream: _get_trtllm_gen_workspace_buffer (≤ foundry branch)
+    # → _get_trtllm_workspace_buffer (main, 2026-07).
+    get_ws = getattr(fi, "_get_trtllm_workspace_buffer", None) or getattr(
+        fi, "_get_trtllm_gen_workspace_buffer", None
+    )
+    if get_ws is not None:
+        get_ws()
     if metadata_builders:
         for b in metadata_builders:
             if isinstance(b, FlashInferMetadataBuilder):

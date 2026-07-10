@@ -495,6 +495,14 @@ def _patch_cuda_graph_wrapper_call() -> None:
             self.concrete_cudagraph_entries[bd] = CUDAGraphEntry(batch_descriptor=bd)
         entry = self.concrete_cudagraph_entries[bd]
 
+        # vLLM main routes CPU-offload prefetch through an offloader that must
+        # be synced around capture/replay; a no-op when offloading is off.
+        # Absent on older branches.
+        try:
+            from vllm.model_executor.offloader.base import get_offloader
+        except ImportError:
+            get_offloader = None
+
         if entry.cudagraph is None:
             if get_graph_extension_mode() != CUDAGraphExtensionMode.LOAD:
                 validate_cudagraph_capturing_enabled()
@@ -507,6 +515,8 @@ def _patch_cuda_graph_wrapper_call() -> None:
                     set_graph_pool_id(self.graph_pool)
                 else:
                     set_graph_pool_id(current_platform.graph_pool_handle())
+                if get_offloader is not None:
+                    get_offloader().sync_prev_onload()
                 graph, output = capture_or_load_graph(
                     batch_descriptor=bd,
                     runnable=self.runnable,
@@ -521,6 +531,8 @@ def _patch_cuda_graph_wrapper_call() -> None:
             compilation_counter.num_cudagraph_captured += 1
             return output
 
+        if get_offloader is not None:
+            get_offloader().sync_prev_onload()
         entry.cudagraph.replay()
         return entry.output
 
@@ -564,7 +576,31 @@ def _patch_initialize_kv_caches() -> None:
                 mode.value.upper(),
             )
 
+        # vLLM main (2026-07) registers kv-cache specs in the engine-core
+        # process before querying them; absent on older branches.
+        try:
+            from vllm.v1.core.kv_cache_utils import register_all_kvcache_specs
+
+            register_all_kvcache_specs(vllm_config)
+        except ImportError:
+            pass
+
         specs = self.model_executor.get_kv_cache_specs()
+
+        # vLLM main: non-causal attention layers force-disable chunked
+        # prefill and prefix caching (mirror of the orig's handling).
+        if any(
+            getattr(spec, "non_causal", False)
+            for worker_specs in specs
+            for spec in worker_specs.values()
+        ):
+            if vllm_config.scheduler_config.enable_chunked_prefill:
+                log.info("[foundry] Disabling chunked prefill: non-causal attention layers.")
+                vllm_config.scheduler_config.enable_chunked_prefill = False
+            if vllm_config.cache_config.enable_prefix_caching:
+                log.info("[foundry] Disabling prefix caching: non-causal attention layers.")
+                vllm_config.cache_config.enable_prefix_caching = False
+
         has_kv = any(s for s in specs)
 
         if ws is not None:
@@ -612,6 +648,16 @@ def _patch_initialize_kv_caches() -> None:
             vllm_config.cache_config.block_size = min(
                 g.kv_cache_spec.block_size for g in sched.kv_cache_groups
             )
+            # vLLM main: record capacity stats on cache_config (used by the
+            # scheduler/telemetry); absent on older branches.
+            try:
+                from vllm.v1.core.kv_cache_utils import get_kv_cache_capacity
+
+                num_tokens, max_concurrency = get_kv_cache_capacity(vllm_config, sched)
+                vllm_config.cache_config.kv_cache_size_tokens = num_tokens
+                vllm_config.cache_config.kv_cache_max_concurrency = max_concurrency
+            except ImportError:
+                pass
         vllm_config.validate_block_size()
 
         self.model_executor.initialize_from_config(cfgs)

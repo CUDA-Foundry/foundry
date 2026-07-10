@@ -155,9 +155,19 @@ def capture_or_load_graph(
     piecewise_compile_index = _piecewise_index(runtime_mode, runnable)
 
     if mode == CUDAGraphExtensionMode.SAVE:
+        # vLLM main: the offloader's copy stream is forked by the last
+        # layer's prefetch and must be joined inside the capture (no-op when
+        # CPU offloading is off; absent on older branches).
+        try:
+            from vllm.model_executor.offloader.base import get_offloader
+        except ImportError:
+            get_offloader = None
+
         graph = FoundryCUDAGraph()
         with foundry_graph_ctx(graph, pool=graph_pool):
             output = runnable(*runnable_args, **runnable_kwargs)
+            if get_offloader is not None:
+                get_offloader().join_after_forward()
 
         assert cfg.workspace_dir is not None
         # The filename alone encodes everything LOAD needs (mode, batch_descriptor,
