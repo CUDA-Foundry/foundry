@@ -1807,6 +1807,30 @@ static void load_cuda_library() {
   dlclose(handle);
 }
 
+// ---------------------------------------------------------------------------
+// Early region reserve: the CUDA driver lazily creates a huge PROT_NONE VA
+// arena (~560 GiB observed) at the first allocation traffic, at a placement
+// that varies per process. When it lands across the foundry region base, the
+// later fixed-address cuMemAddressReserve in set_allocation_region is bumped
+// and the region gets disabled (intermittent TP-worker LOAD failures).
+//
+// Holding the VA with a plain mmap does NOT work: the driver's VA manager
+// snapshots the address space when it initializes, and ranges busy at that
+// moment stay excluded from its allocator even after munmap (verified: a
+// fully-free range was refused, reserve returned the old placeholder end).
+//
+// Instead, claim the region THROUGH the driver as the first VA operation
+// after context creation — before module loading / allocation traffic can
+// trigger the arena. set_allocation_region is idempotent for a repeated
+// same-base/same-size call, so the integration's later explicit call
+// becomes a no-op. Enabled via FOUNDRY_PREMAP_BASE / FOUNDRY_PREMAP_SIZE
+// (set by the integration's setup_ld_preload_env from the TOML config).
+// ---------------------------------------------------------------------------
+
+// The implementation (try_early_region_reserve, defined next to
+// set_allocation_region) is called from load_cuda_modules_and_libraries
+// right after the context is ensured.
+
 static void __attribute__((constructor)) init_hook() {
   load_cuda_library();
 
@@ -3101,6 +3125,24 @@ void set_allocation_region(void* base, size_t size) {
             base, kAllocAlignment, (void*)aligned_base);
   }
 
+  // Idempotent re-set: the early reserve at context creation (see
+  // try_early_region_reserve) already established this exact region; the
+  // integration's later explicit call must not re-reserve (the driver would
+  // return a different address for the occupied range). Cursor state is
+  // reset exactly as a fresh set would, so the semantics match today's
+  // re-set path minus the reservation itself.
+  if (tls_storage.region_initialized && (size_t)tls_storage.region.base == aligned_base &&
+      tls_storage.region.size == size) {
+    tls_storage.current_alloc_base_addr = aligned_base;
+    tls_storage.current_vmm_reserve_addr = align_to(aligned_base + size, kAllocAlignment);
+    tls_storage.enabled = true;
+#ifdef HOOK_DEBUG
+    fprintf(stderr, "[HOOK] Allocation region already set (base=%p size=%zu), re-enabled\n",
+            (void*)aligned_base, size);
+#endif
+    return;
+  }
+
   typedef CUresult (*cuMemAddressReserve_t)(CUdeviceptr*, size_t, size_t, CUdeviceptr,
                                             unsigned long long);
   auto reserve_func = (cuMemAddressReserve_t)CUDA_DRIVER_CALL(cuda_driver_entry_table,
@@ -3184,6 +3226,25 @@ void resume_allocation_region() {
   fprintf(stderr, "[HOOK] Allocation region resumed: base=%p size=%zu\n", tls_storage.region.base,
           tls_storage.region.size);
 #endif
+}
+
+static void try_early_region_reserve() {
+  if (tls_storage.region_initialized) {
+    return;
+  }
+  const char* base_s = std::getenv("FOUNDRY_PREMAP_BASE");
+  const char* size_s = std::getenv("FOUNDRY_PREMAP_SIZE");
+  if (!base_s || !size_s) {
+    return;
+  }
+  uintptr_t base = (uintptr_t)strtoull(base_s, nullptr, 0);
+  size_t size = (size_t)strtoull(size_s, nullptr, 0);
+  if (base == 0 || size == 0) {
+    return;
+  }
+  fprintf(stderr, "[HOOK] Early region reserve at %p size %zu (pre module-load)\n", (void*)base,
+          size);
+  set_allocation_region((void*)base, size);
 }
 
 bool allocation_region_enabled() {
@@ -3814,6 +3875,12 @@ void load_cuda_modules_and_libraries(const std::string& archive_dir) {
     }
 #endif
   }
+
+  // Claim the region VA through the driver BEFORE module loading: the ~0.5GB
+  // of fatbin loads below can trigger the driver's lazy VA arena, whose
+  // variable placement otherwise occasionally straddles the region base and
+  // bumps the later fixed-address reserve (intermittent TP LOAD failures).
+  try_early_region_reserve();
 
   std::call_once(load_once_flag, [&archive_dir]() {
     const fs::path packed_img_path = fs::path(archive_dir) / "fatbin_image_packed.img";
