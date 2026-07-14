@@ -10,6 +10,7 @@ recipe/vllm/
 ├── foundry_save.toml                 # shared SAVE config (workspace_root = "foundry_archive")
 ├── foundry_load.toml                 # shared LOAD config (same workspace_root)
 ├── serve_qwen3-mini.sh               # Qwen3-1.7B           single GPU
+├── serve_qwen3-1.7b_tp.sh            # Qwen3-1.7B           tensor parallel (symm-mem allreduce)
 ├── serve_qwen3-14b_dp.sh             # Qwen3-14B            data parallel
 ├── serve_qwen3-30ba3b_ep.sh          # Qwen3-30B-A3B (MoE)  expert parallel (DeepEP)
 └── serve_qwen3-30ba3bfp8_ep.sh       # Qwen3-30B-A3B FP8    expert parallel (DeepGEMM)
@@ -19,6 +20,7 @@ Every script accepts the same trailing `--save` / `--load` flag. Scripts that sc
 
 ```bash
 bash serve_qwen3-mini.sh              [--save|--load]
+bash serve_qwen3-1.7b_tp.sh       <tp_size> [--save|--load]
 bash serve_qwen3-14b_dp.sh        <dp_size> [--save|--load]
 bash serve_qwen3-30ba3b_ep.sh     <ep_size> [--save|--load]
 bash serve_qwen3-30ba3bfp8_ep.sh  <ep_size> [--save|--load]
@@ -54,7 +56,7 @@ pip install uv
 ```bash
 git clone https://github.com/foundry-org/vllm.git
 cd vllm
-git checkout foundry
+git checkout foundry-main-rebase     # pairs with foundry branch `bump`
 VLLM_USE_PRECOMPILED=1 uv pip install --editable . \
     --extra-index-url https://wheels.vllm.ai/nightly/cu130
 cd ..
@@ -65,7 +67,8 @@ Verify the install with `uv pip list`:
 ```
 nvidia-cublas    13.1.0.3
 torch            2.11.0(+cu130)
-vllm             0.1.dev15646+g040974074.precompiled
+transformers     >= 5.5.3      # vLLM main dropped Transformers v4
+vllm             0.1.dev18535+geed7819a2.precompiled
 ```
 
 ### 3. Install Foundry
@@ -166,6 +169,21 @@ All scripts, when invoked with `--save` or `--load`, export one env-var override
 
 - `VLLM_USE_V2_MODEL_RUNNER=0` — pin the V1 model runner. Foundry's monkey-patches are on `vllm.v1.worker.gpu_model_runner.GPUModelRunner`; vLLM's `VllmConfig.use_v2_model_runner` property silently routes architectures in `DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES` (currently `Qwen3ForCausalLM`) to `vllm.v1.worker.gpu.model_runner` (V2), which our patches don't touch. Without this pin, `capture_model` runs unhooked, no archive is written, and SAVE silently produces an empty workspace.
 
+The TP script (`serve_qwen3-1.7b_tp.sh`) on top of the basic flags also sets:
+
+- `--disable-custom-all-reduce` — custom all-reduce registers IPC buffers per
+  captured graph, a replay path foundry does not support yet. With it off,
+  every decode-graph allreduce dispatches to vLLM's torch symmetric-memory
+  backend (`VLLM_ALLREDUCE_USE_SYMM_MEM=1`, the upstream default), whose
+  persistent buffer + peer-pointer arrays foundry places deterministically.
+- `--compilation-config.pass_config.fuse_allreduce_rms false` — vLLM main's
+  FlashInfer allreduce+rmsnorm fusion pass would otherwise rewrite the
+  allreduce into trtllm fused kernels whose FlashInfer workspace foundry does
+  not replay yet. With the flag off, the decode graphs contain plain
+  `symm_mem.two_shot_all_reduce_` kernels (TP=2 on Hopper).
+- `NCCL_CUMEM_ENABLE=0` / `NCCL_NVLS_ENABLE=0` — same NCCL fast-path pins as
+  the EP scripts (prefill / non-graph collectives still go through pynccl).
+
 The two EP scripts (`*_ep.sh`) on top of the basic flags also set:
 
 - `--enable-expert-parallel --all2all-backend deepep_low_latency`.
@@ -191,13 +209,14 @@ nvshmem_qp_depth >= (num_max_dispatch_tokens_per_rank + 1) * 2
 
 - All scripts pin `--compilation-config.cudagraph_mode FULL_DECODE_ONLY` and capture all sizes `1..max-num-batched-tokens`.
 - All scripts use port `12000` and host `0.0.0.0`.
-- The shared TOMLs use `base_addr = 0x600000000000` and `region_size = "256GB"`. If you serve a much larger model, bump `region_size` in both TOMLs (the values must match across SAVE and LOAD).
+- The shared TOMLs use `base_addr = 0x400000000000` and `region_size = "256GB"`. If you serve a much larger model, bump `region_size` in both TOMLs (the values must match across SAVE and LOAD).
+- **base_addr changed from `0x600000000000` (older releases) to `0x400000000000`**: the old base sits inside the kernel's PIE-executable ASLR window `[0x555555554000, ~0x7fff…]`, so the python binary itself intermittently lands inside the region and the fixed-address reserve fails (more likely the more worker processes you run). Archives are baked against a base — re-run SAVE after upgrading; a LOAD TOML must always carry the same `base_addr` as the SAVE that produced the archive.
 
 ## Troubleshooting
 
 | Symptom | Likely cause |
 |---|---|
-| `[HOOK] ERROR: Reserved address … != requested base 0x600000000000` | The VMM region base collided with another allocation. Re-run; this is non-deterministic and the second run usually succeeds. |
+| `[HOOK] ERROR: Reserved address … != requested base …` | Something already occupies the region VA range in that process — the `[HOOK] DIAG(pid …)` lines that follow list the overlapping mappings. With the old `base_addr = 0x600000000000` this was usually the python executable itself (PIE ASLR window); use `0x400000000000`. |
 | `[HOOK] WARNING: Neither nvshmemx_cumodule_init nor nvshmemx_culibrary_init found` | `libnvshmem_host.so` is not in `LD_PRELOAD`. EP scripts need both `libcuda_hook.so` *and* `libnvshmem_host.so` preloaded. |
 | EP graph replay fails with `illegal memory access` | Almost always `libnvshmem_host.so` isn't preloaded. |
 | `[foundry] LOAD requires warmup_state.json` raised on LOAD | SAVE pass 1 didn't write `warmup_state.json`. Make sure SAVE finishes "Application startup complete" before you Ctrl-C, and re-run pass 1, then pass 2. |

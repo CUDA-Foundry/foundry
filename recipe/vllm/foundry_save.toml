@@ -1,5 +1,10 @@
 mode = "save"
-base_addr = 0x600000000000
+# 0x400000000000 (64 TiB) sits BELOW the kernel PIE-ASLR window
+# [0x555555554000, ~0x7fff...] — a base inside that window (e.g. the old
+# 0x600000000000) intermittently collides with the python executable mapping
+# and the fixed-address region reserve fails. Must match across SAVE/LOAD;
+# changing it invalidates existing archives.
+base_addr = 0x400000000000
 region_size = "256GB"
 workspace_root = "foundry_archive"
 scratch_space_size = "4096MB"
