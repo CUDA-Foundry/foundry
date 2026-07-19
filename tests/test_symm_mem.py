@@ -2,26 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the Foundry project
 """Standalone foundry save/load test for torch symmetric-memory allreduce.
 
-Mirrors tests/test_deepep_fabric.py but exercises the TP-allreduce path that
-vLLM main uses by default (VLLM_ALLREDUCE_USE_SYMM_MEM=1):
-
-    buffer = torch_symm_mem.empty(...); torch_symm_mem.rendezvous(buffer, group)
-    # captured in the decode graph:
-    buffer[:n].copy_(inp); torch.ops.symm_mem.two_shot_all_reduce_(buffer[:n],
-    "sum", group); out.copy_(buffer[:n])
-
-Driver-level background (torch 2.11, CUDA backend, single node):
-  - torch resolves cuMem* via cudaGetDriverEntryPointByVersion -> hooked dlsym
-    -> hooked cuGetProcAddress_v2. Foundry redirects cuMemAddressReserve (VA
-    steering) but passes cuMemCreate/cuMemMap/cuMulticast* to the real driver.
-  - Handle exchange is torch's own AF_UNIX SCM_RIGHTS IpcChannel — foundry's
-    VMM-IPC translation is NOT involved (unlike DeepEP's legacy cudaIpc path).
-  - The allreduce kernels read peer pointers from a device array
-    (buffer_ptrs_dev) at RUN time; the captured graph bakes only the local
-    buffer VA (copy kernels + tensor arg) and the dev-array addresses.
-
-So the test answers: are the local symm buffer VA and the dev arrays placed
-deterministically enough across 2nd-SAVE and LOAD for replay to be correct?
+Captures the op sequence vLLM's SymmMemCommunicator uses for TP allreduce
+(copy-in -> two_shot/multimem all-reduce in place on the persistent
+symmetric buffer -> copy-out) into a CUDA graph, saves it with foundry, and
+verifies LOAD replays it correctly. The graph bakes the local buffer VA and
+the peer-pointer device-array addresses; the test asserts they are placed
+identically across SAVE and LOAD and that replayed allreduce results are
+exact.
 
 Usage (LD_PRELOAD libcuda_hook.so; see tests/run_symm_mem.sh):
   python tests/test_symm_mem.py --save --num-processes=2
@@ -29,7 +16,7 @@ Usage (LD_PRELOAD libcuda_hook.so; see tests/run_symm_mem.sh):
 
 Env knobs:
   TEST_SYMM_ALGO   two_shot (default) | multimem | one_shot
-  TEST_BUF_MB      symm buffer size in MiB (default 8, matches small TP slices)
+  TEST_BUF_MB      symmetric buffer size in MiB (default 8)
 """
 
 import argparse
@@ -250,24 +237,24 @@ def _run_load(local_rank: int, num_processes: int):
         flush=True,
     )
 
-    # Cross-check determinism vs SAVE (informational + hard assert on the
-    # addresses the captured graph bakes).
+    # The captured graph bakes these addresses — LOAD placement must be
+    # identical to SAVE for replay to be sound.
     with open(os.path.join(rank_archive, "symm_meta.json")) as f:
         saved = json.load(f)
-    for key in ("buffer_va", "buffer_ptrs_dev", "signal_pad_ptrs_dev", "multicast_ptr"):
-        sv, lv = saved["info"][key], info[key]
+    checks = {key: (saved["info"][key], info[key]) for key in saved["info"]}
+    checks["inp_va"] = (saved["inp_va"], inp.data_ptr())
+    checks["out_va"] = (saved["out_va"], out.data_ptr())
+    mismatched = []
+    for key, (sv, lv) in checks.items():
         match = "MATCH" if sv == lv else "MISMATCH"
         print(
             f"[Rank {rank}] LOAD: {key}: save={hex(sv)} load={hex(lv)} -> {match}",
             flush=True,
         )
-    for key, lv in (("inp_va", inp.data_ptr()), ("out_va", out.data_ptr())):
-        sv = saved[key]
-        match = "MATCH" if sv == lv else "MISMATCH"
-        print(
-            f"[Rank {rank}] LOAD: {key}: save={hex(sv)} load={hex(lv)} -> {match}",
-            flush=True,
-        )
+        if sv != lv:
+            mismatched.append(key)
+    if mismatched:
+        raise RuntimeError(f"LOAD placement diverged from SAVE for: {mismatched}")
 
     # Eager warmup: triggers torch symm-mem kernel module loads (tracked as
     # warmup handles) and validates the live rendezvous before replay.

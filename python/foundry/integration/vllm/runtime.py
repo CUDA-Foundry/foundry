@@ -381,17 +381,15 @@ def setup_ld_preload_env() -> None:
     if mode != CUDAGraphExtensionMode.NONE:
         os.environ["FOUNDRY_MODE"] = mode.value
 
-    # Early region reserve: the hook claims [base, base+region_size) through
-    # the driver right after context creation on LOAD, before module loading
-    # can trigger the CUDA driver's lazily-placed VA arena (~560 GiB) that
-    # otherwise occasionally straddles the base and bumps the fixed-address
-    # reserve (intermittent TP-worker failures). Size must equal region_size
-    # exactly — setup_graph_extension's set_allocation_region call is then an
+    # Early region reserve: on LOAD the hook claims [base, base+region_size)
+    # right after context creation, before module loading can trigger the
+    # CUDA driver's lazily-placed VA arena. Size must equal region_size
+    # exactly so setup_graph_extension's set_allocation_region call is an
     # idempotent no-op against the early reservation.
     cfg = get_config()
     if cfg is not None and mode != CUDAGraphExtensionMode.NONE:
-        os.environ["FOUNDRY_PREMAP_BASE"] = hex(cfg.base_addr)
-        os.environ["FOUNDRY_PREMAP_SIZE"] = str(parse_size(cfg.region_size))
+        os.environ["FOUNDRY_EARLY_RESERVE_BASE"] = hex(cfg.base_addr)
+        os.environ["FOUNDRY_EARLY_RESERVE_SIZE"] = str(parse_size(cfg.region_size))
 
     # Overwrite every spawn site — child reads it on entry.
     os.environ["FOUNDRY_SPAWN_T0_NS"] = str(time.perf_counter_ns())
