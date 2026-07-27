@@ -47,6 +47,9 @@ struct __attribute__((visibility("default"))) KernelNodeMetadata {
     int accessPolicyWindowHitProp = 0;
     int accessPolicyWindowMissProp = 0;
 
+    bool has_programmatic_stream_serialization = false;
+    int programmaticStreamSerializationAllowed = 0;
+
     bool has_device_updatable = false;
     int deviceUpdatable = 0;
     CUgraphDeviceNode deviceUpdatableNode = nullptr;
@@ -202,6 +205,12 @@ struct EmptyNodeMetadata {};
 struct GraphDependency {
   int from_index;
   int to_index;
+  // CUgraphEdgeData. Non-default ports/type carry programmatic-dependent-
+  // launch (PDL) semantics; dropping them on rebuild downgrades PDL overlap
+  // (e.g. FA3 prepare->fwd->combine on Hopper) to full serialization.
+  unsigned char from_port = 0;
+  unsigned char to_port = 0;
+  unsigned char edge_type = 0;
 };
 
 using GraphNodeMetadata =

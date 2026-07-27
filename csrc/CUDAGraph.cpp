@@ -755,6 +755,21 @@ void CUDAGraph::analyze_captured_graph() {
                 attr_val.deviceUpdatableKernelNode.deviceUpdatable;
             metadata.node_attrs.deviceUpdatableNode = attr_val.deviceUpdatableKernelNode.devNode;
           }
+
+          // Programmatic dependent launch: kernels captured from PDL launches
+          // (cudaLaunchKernelExC with PROGRAMMATIC_STREAM_SERIALIZATION, e.g.
+          // FA3 fwd/combine on sm90) carry this node attribute; a rebuilt
+          // node without it loses the launch overlap the attribute permits.
+          res = cuGraphKernelNodeGetAttribute(
+              nodes[i],
+              static_cast<CUkernelNodeAttrID>(
+                  CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION),
+              &attr_val);
+          if (res == CUDA_SUCCESS) {
+            metadata.node_attrs.has_programmatic_stream_serialization = true;
+            metadata.node_attrs.programmaticStreamSerializationAllowed =
+                attr_val.programmaticStreamSerializationAllowed;
+          }
         }
       }
 
@@ -934,6 +949,9 @@ void CUDAGraph::analyze_captured_graph() {
         GraphDependency dep;
         dep.from_index = from_it->second;
         dep.to_index = to_it->second;
+        dep.from_port = edges[i].from_port;
+        dep.to_port = edges[i].to_port;
+        dep.edge_type = edges[i].type;
         graph_dependencies.push_back(dep);
       }
     }
@@ -1093,6 +1111,11 @@ void CUDAGraph::save(const std::string& json_path, const OutputTensors& output_t
           kernel_node_attrs["deviceUpdatable"] = metadata.node_attrs.deviceUpdatable;
           kernel_node_attrs["deviceUpdatableNode"] = static_cast<uint64_t>(
               reinterpret_cast<uintptr_t>(metadata.node_attrs.deviceUpdatableNode));
+        }
+        if (metadata.node_attrs.has_programmatic_stream_serialization &&
+            metadata.node_attrs.programmaticStreamSerializationAllowed != 0) {
+          kernel_node_attrs["programmaticStreamSerialization"] =
+              metadata.node_attrs.programmaticStreamSerializationAllowed;
         }
         params["kernel_node_attrs"] = kernel_node_attrs;
       }
@@ -1447,6 +1470,17 @@ void CUDAGraph::save(const std::string& json_path, const OutputTensors& output_t
     json::object dep_obj;
     dep_obj["from"] = dep.from_index;
     dep_obj["to"] = dep.to_index;
+    // Edge data (ports/type) only when non-default — default edges stay
+    // compact and load exactly as before.
+    if (dep.from_port != 0) {
+      dep_obj["from_port"] = dep.from_port;
+    }
+    if (dep.to_port != 0) {
+      dep_obj["to_port"] = dep.to_port;
+    }
+    if (dep.edge_type != 0) {
+      dep_obj["edge_type"] = dep.edge_type;
+    }
     deps_array.push_back(dep_obj);
   }
   root["dependencies"] = deps_array;
@@ -2042,6 +2076,9 @@ GraphLoadResult CUDAGraph::load(const std::string& json_path, MempoolId_t pool) 
     from_nodes.reserve(deps_array.size());
     to_nodes.reserve(deps_array.size());
 
+    std::vector<CUgraphEdgeData> edge_data(deps_array.size());
+    memset(edge_data.data(), 0, edge_data.size() * sizeof(CUgraphEdgeData));
+    size_t di = 0;
     for (const auto& dep_val : deps_array) {
       const json::object& dep_obj = dep_val.as_object();
       int from_id = dep_obj.at("from").to_number<int>();
@@ -2049,14 +2086,25 @@ GraphLoadResult CUDAGraph::load(const std::string& json_path, MempoolId_t pool) 
 
       from_nodes.push_back(id_to_node[from_id]);
       to_nodes.push_back(id_to_node[to_id]);
+      // Restore edge data (PDL programmatic ports); absent fields = default.
+      if (auto* v = dep_obj.if_contains("from_port")) {
+        edge_data[di].from_port = (unsigned char)v->to_number<int>();
+      }
+      if (auto* v = dep_obj.if_contains("to_port")) {
+        edge_data[di].to_port = (unsigned char)v->to_number<int>();
+      }
+      if (auto* v = dep_obj.if_contains("edge_type")) {
+        edge_data[di].type = (unsigned char)v->to_number<int>();
+      }
+      di++;
     }
 
 #if (defined(CUDA_VERSION) && CUDA_VERSION >= 13000)
     CUresult dep_result = cuGraphAddDependencies(cuGraph, from_nodes.data(), to_nodes.data(),
-                                                 nullptr, deps_array.size());
+                                                 edge_data.data(), deps_array.size());
 #else
     CUresult dep_result = cuGraphAddDependencies_v2(cuGraph, from_nodes.data(), to_nodes.data(),
-                                                    nullptr, deps_array.size());
+                                                    edge_data.data(), deps_array.size());
 #endif
     if (dep_result != CUDA_SUCCESS) {
       fprintf(stderr, "[foundry LOAD ERROR] cuGraphAddDependencies FAILED with error %d\n",

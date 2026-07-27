@@ -205,6 +205,8 @@ GraphLoadResult CUDAGraph::build_graph_from_parsed(ParsedGraphData&& parsed, CUc
                common_preferred_cluster_z = 0;
   bool has_common_preferred_shared_mem_carveout = false;
   unsigned int common_preferred_shared_mem_carveout = 0;
+  bool has_common_programmatic_stream_serialization = false;
+  int common_programmatic_stream_serialization = 0;
   bool has_common_attrs = false;
 
   if (root.contains("common_kernel_node_attrs")) {
@@ -249,6 +251,11 @@ GraphLoadResult CUDAGraph::build_graph_from_parsed(ParsedGraphData&& parsed, CUc
       has_common_preferred_shared_mem_carveout = true;
       common_preferred_shared_mem_carveout =
           common.at("preferredSharedMemCarveout").to_number<unsigned int>();
+    }
+    if (common.contains("programmaticStreamSerialization")) {
+      has_common_programmatic_stream_serialization = true;
+      common_programmatic_stream_serialization =
+          common.at("programmaticStreamSerialization").to_number<int>();
     }
   }
 
@@ -319,6 +326,8 @@ GraphLoadResult CUDAGraph::build_graph_from_parsed(ParsedGraphData&& parsed, CUc
       int access_policy_hit_prop = 0, access_policy_miss_prop = 0;
       bool has_device_updatable = false;
       int device_updatable = 0;
+      bool has_programmatic_stream_serialization = false;
+      int programmatic_stream_serialization = 0;
 
       if (params.contains("kernel_node_attrs")) {
         const json::object& node_attrs = params.at("kernel_node_attrs").as_object();
@@ -372,6 +381,11 @@ GraphLoadResult CUDAGraph::build_graph_from_parsed(ParsedGraphData&& parsed, CUc
         if (node_attrs.contains("deviceUpdatable")) {
           has_device_updatable = true;
           device_updatable = node_attrs.at("deviceUpdatable").to_number<int>();
+        }
+        if (node_attrs.contains("programmaticStreamSerialization")) {
+          has_programmatic_stream_serialization = true;
+          programmatic_stream_serialization =
+              node_attrs.at("programmaticStreamSerialization").to_number<int>();
         }
       }
 
@@ -598,6 +612,15 @@ GraphLoadResult CUDAGraph::build_graph_from_parsed(ParsedGraphData&& parsed, CUc
         C10_CUDA_DRIVER_CHECK(cuGraphKernelNodeSetAttribute(
             cuNode, CU_KERNEL_NODE_ATTRIBUTE_DEVICE_UPDATABLE_KERNEL_NODE, &updatable_attr));
       }
+      if (has_programmatic_stream_serialization) {
+        CUkernelNodeAttrValue pss_attr;
+        memset(&pss_attr, 0, sizeof(pss_attr));
+        pss_attr.programmaticStreamSerializationAllowed = programmatic_stream_serialization;
+        C10_CUDA_DRIVER_CHECK(cuGraphKernelNodeSetAttribute(
+            cuNode,
+            static_cast<CUkernelNodeAttrID>(CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION),
+            &pss_attr));
+      }
 
     } else if (node_type == "MemcpyNode") {
       CUDA_MEMCPY3D copy_params;
@@ -769,6 +792,17 @@ GraphLoadResult CUDAGraph::build_graph_from_parsed(ParsedGraphData&& parsed, CUc
             node, CU_KERNEL_NODE_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT, &carveout_attr));
       }
     }
+    if (has_common_programmatic_stream_serialization) {
+      CUkernelNodeAttrValue pss_attr;
+      memset(&pss_attr, 0, sizeof(pss_attr));
+      pss_attr.programmaticStreamSerializationAllowed = common_programmatic_stream_serialization;
+      for (auto node : kernel_nodes_for_common_attrs) {
+        C10_CUDA_DRIVER_CHECK(cuGraphKernelNodeSetAttribute(
+            node,
+            static_cast<CUkernelNodeAttrID>(CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION),
+            &pss_attr));
+      }
+    }
   }
 
   // Add dependencies
@@ -779,18 +813,32 @@ GraphLoadResult CUDAGraph::build_graph_from_parsed(ParsedGraphData&& parsed, CUc
     from_nodes.reserve(deps_array.size());
     to_nodes.reserve(deps_array.size());
 
+    std::vector<CUgraphEdgeData> edge_data(deps_array.size());
+    memset(edge_data.data(), 0, edge_data.size() * sizeof(CUgraphEdgeData));
+    size_t di = 0;
     for (const auto& dep_val : deps_array) {
       const json::object& dep_obj = dep_val.as_object();
       from_nodes.push_back(id_to_node[dep_obj.at("from").to_number<int>()]);
       to_nodes.push_back(id_to_node[dep_obj.at("to").to_number<int>()]);
+      // Restore edge data (PDL programmatic ports); absent fields = default.
+      if (auto* v = dep_obj.if_contains("from_port")) {
+        edge_data[di].from_port = (unsigned char)v->to_number<int>();
+      }
+      if (auto* v = dep_obj.if_contains("to_port")) {
+        edge_data[di].to_port = (unsigned char)v->to_number<int>();
+      }
+      if (auto* v = dep_obj.if_contains("edge_type")) {
+        edge_data[di].type = (unsigned char)v->to_number<int>();
+      }
+      di++;
     }
 
 #if (defined(CUDA_VERSION) && CUDA_VERSION >= 13000)
     CUresult dep_result = cuGraphAddDependencies(cuGraph, from_nodes.data(), to_nodes.data(),
-                                                 nullptr, deps_array.size());
+                                                 edge_data.data(), deps_array.size());
 #else
     CUresult dep_result = cuGraphAddDependencies_v2(cuGraph, from_nodes.data(), to_nodes.data(),
-                                                    nullptr, deps_array.size());
+                                                    edge_data.data(), deps_array.size());
 #endif
     if (dep_result != CUDA_SUCCESS) {
       fprintf(stderr, "[foundry LOAD ERROR] cuGraphAddDependencies FAILED with error %d\n",
