@@ -3158,6 +3158,10 @@ void resume_allocation_region() {
 #endif
 }
 
+bool allocation_region_enabled() {
+  return tls_storage.enabled;
+}
+
 bool preallocate_region(size_t size) {
   if (!tls_storage.region_initialized) {
     fprintf(stderr, "[HOOK] ERROR: Cannot preallocate before allocation region is set\n");
