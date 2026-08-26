@@ -69,6 +69,13 @@ def test_re_exports_present():
     )
 
 
+def test_cudagraph_reexport_uses_python_wrapper():
+    foundry = importlib.import_module("foundry")
+    graph_module = importlib.import_module("foundry.graph")
+
+    assert foundry.CUDAGraph is graph_module.CUDAGraph
+
+
 def test_vllm_integration_public_api():
     mod = importlib.import_module("foundry.integration.vllm")
     for name in ("install_hooks", "CUDAGraphExtensionMode", "get_graph_extension_mode"):

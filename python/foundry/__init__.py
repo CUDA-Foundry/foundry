@@ -9,12 +9,13 @@ from .allocation_region import (
     resume_allocation_region,
     set_current_alloc_offset,
 )
+
+from .ops import *  # isort: skip
 from .graph import (
     CUDAGraph,
     graph,
     save_graph_manifest,
 )
-from .ops import *
 
 # Re-exports. Listed here so ruff's --fix doesn't strip them as unused.
 # (We also configure per-file-ignores for F401 in pyproject.toml as a backstop.)
