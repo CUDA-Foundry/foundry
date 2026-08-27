@@ -73,16 +73,16 @@ Foundry ships engine integrations under `foundry/python/foundry/integration/`. P
 
 | Engine | Integration code | Documentation | Setup Instructions |
 |---|---|---|---|
-| vLLM | [`integration/vllm/`](python/foundry/integration/vllm/) | [`docs/vllm/overview.md`](docs/vllm/overview.md) | [`recipe/vllm/README.md`](recipe/vllm/README.md) |
 | SGLang | [`integration/sglang/`](python/foundry/integration/sglang/) | [`docs/sglang/overview.md`](docs/sglang/overview.md) | [`recipe/sglang/README.md`](recipe/sglang/README.md) |
+| vLLM | [`integration/vllm/`](python/foundry/integration/vllm/) | [`docs/vllm/overview.md`](docs/vllm/overview.md) | [`recipe/vllm/README.md`](recipe/vllm/README.md) |
 | TensorRT-LLM | [`integration/trtllm/`](python/foundry/integration/trtllm/) | [`docs/trtllm/overview.md`](docs/trtllm/overview.md) | [`recipe/trtllm/README.md`](recipe/trtllm/README.md) |
 
 ### Status
 
 | Engine | Single GPU | DP | TP | EP |
 |---|:---:|:---:|:---:|:---:|
-| vLLM | ✅ | ✅ | 🚧 | ✅ |
 | SGLang | ✅ | ✅ | 🚧 | ✅ |
+| vLLM | ✅ | ✅ | 🚧 | ✅ |
 | TensorRT-LLM | 🚧 | 🚧 | 🚧 | 🚧 |
 
 ✅ validated end-to-end (SAVE → LOAD → query) &nbsp;·&nbsp; 🚧 not yet
