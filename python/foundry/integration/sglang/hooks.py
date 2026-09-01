@@ -342,14 +342,27 @@ def _patch_cuda_graph_capture() -> None:
         # bootstrap_deepep_buffer runs on both (cheap singleton) to guarantee the
         # NVSHMEM runtime is up before replay on LOAD / before capture on SAVE.
         if _ep_lazy_init_needed():
-            if mode == CUDAGraphExtensionMode.SAVE:
-                _run_warmup_pass(self)
             if mode != CUDAGraphExtensionMode.NONE:
                 from foundry.integration.sglang.graph_ops import (
                     bootstrap_deepep_buffer,
                 )
 
+                # Bootstrap BEFORE the SAVE warmup pass so the DeepEP buffer
+                # is created at the same allocation-sequence point in both
+                # modes. When it was created lazily inside the warmup pass
+                # (SAVE) but by this bootstrap (LOAD), its VMM address
+                # differed between the two modes — one-sided NVSHMEM traffic
+                # and restored-graph references then hit the SAVE-time
+                # address while the runtime used the LOAD-time one,
+                # corrupting whatever eager tensor later reused that VA
+                # (deterministic wrong first token / sporadic illegal access
+                # on the EP dp-attention path; docs/sglang/known-issues.md).
+                rt.log_alloc_offset("before_deepep_bootstrap")
                 bootstrap_deepep_buffer(self)
+                rt.log_alloc_offset("after_deepep_bootstrap")
+            if mode == CUDAGraphExtensionMode.SAVE:
+                _run_warmup_pass(self)
+                rt.log_alloc_offset("after_warmup_pass")
 
         if mode == CUDAGraphExtensionMode.LOAD:
             from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -391,6 +404,17 @@ def _patch_cuda_graph_capture() -> None:
             # graph-by-graph in the same order SAVE captured them.
             load_all_graphs(self)
             rt.log_alloc_offset("after_load_all_graphs")
+            # Surrender torch-cached-but-free segments so later eager
+            # allocations cannot reuse VA ranges that restored graphs may
+            # reference internally (torch graph POOLs provide this protection
+            # on SAVE; LOAD rebuilds graph memory at the driver level with no
+            # pool bookkeeping). NOTE: hygiene, not a complete fix — see
+            # docs/sglang/known-issues.md (EP dp-attention LOAD corruption).
+            import torch
+
+            torch.cuda.empty_cache()
+            rt.log_alloc_offset("after_post_load_empty_cache")
+
             self.graphs = {k: v[0] for k, v in state.loaded_graphs.items()}
             self.output_buffers = {k: v[1] for k, v in state.loaded_graphs.items()}
             # Non-FlashInfer backends (e.g. fa3) populate per-bs decode metadata

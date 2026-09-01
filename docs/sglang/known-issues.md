@@ -1,6 +1,6 @@
 # Known issues — SGLang integration
 
-## LOAD-mode first-token corruption on the EP / dp-attention path (OPEN)
+## LOAD-mode first-token corruption on the EP / dp-attention path (FIXED)
 
 **Symptom.** On a foundry-LOADed EP server (Qwen3-30B-A3B, EP=2,
 fa3 + dp-attention + DeepEP low-latency), some prompts deterministically get
@@ -54,19 +54,65 @@ integration also populated fa3 metadata post-load without the capture-time
 warmup forwards. Earlier validations measured throughput and coherence,
 not token-level parity, so this went unnoticed.
 
-**Next steps.**
+**Deep-dive round 2 (2026-09-01, instrumented; all sglang instrumentation
+reverted afterwards).** The earlier metadata theory is REFUTED; the full
+localization chain, each step measured:
 
-1. Instrument `init_forward_metadata_out_graph` /
-   `_apply_cuda_graph_metadata` on LOAD: log (forward_mode, bs,
-   id(metadata), max_seq_len_k, cu_seqlens) per call; diff a dirty vs clean
-   request to name the exact consumer that skips init.
-2. Fix direction: make the LOAD pre-pass reproduce the *post-capture* state
-   exactly — either run the same per-bs dummy forwards upstream capture
-   runs (the SAVE-side EP warmup-pass machinery, adapted to not re-enter
-   graph_capture on LOAD), or make the consumer initialize its metadata
-   instead of reusing the leftover.
-3. Add a token-parity check (fixed prompt set, temp 0, logprobs) to the
-   validation recipe so LOAD-vs-baseline divergence is caught routinely.
+- The serving rank's prefill runs with CORRECT attention metadata
+  (max_seq_len_k == prompt length) and per-layer last-token hidden norms are
+  IDENTICAL between a clean and a dirty request through all 48 layers.
+- The dp-attention hidden gather is correct: right variant (SUM_LEN /
+  all-reduce with pre-zeroed buffer), correct offsets (get_dp_local_info),
+  and the all-reduce output norm is identical on both ranks and equal to the
+  clean value. Logits-shard assembly offsets are correct too.
+- The corruption materializes between the LM-head matmul and the sampled
+  token: the logits processor already emits argmax=" zeroes" on dirty
+  requests. Serving-rank asymmetry: dp_rank 0 requests are always clean;
+  dp_rank 1 requests are corrupted (prompt-dependent visibility).
+- NOT an execution-order race: persists under CUDA_LAUNCH_BLOCKING=1.
+- NOT torch-cache aliasing alone: `torch.cuda.empty_cache()` after graph
+  load does not fix it (kept in hooks as hygiene regardless).
+- ADDRESS-DISPLACEMENT SENSITIVE (smoking gun): planting a 64 MB tensor at
+  the exact region boundary (final_alloc_offset, 0x601cb2200000 on the dirty
+  rank) makes ALL requests clean — and the canary itself records ZERO
+  corrupted bytes. So nothing writes into that band; displacing runtime
+  eager allocations off their default addresses removes the corruption.
+  Conclusion: some component holds a STALE INIT-TIME POINTER to an address
+  in the early eager zone; when the runtime allocator reuses that address
+  for a live tensor (logits-path tensors by default), the stale reference
+  corrupts it. One-sided (NVSHMEM/DeepEP) access explains the
+  launch-blocking immunity and the sporadic illegal accesses.
+
+**Prime suspect / exact-divergence hypothesis:** the DeepEP buffer address
+differs between SAVE and LOAD. On SAVE it is created mid-warmup-pass
+(interleaved with activation allocations); on LOAD, `bootstrap_deepep_buffer`
+creates it in isolation → different VMM address for the same object, while
+`preallocate_for_load_mode` jumps the cursor to final_alloc_offset and MASKS
+the order divergence. Restored graphs and the peer rank's one-sided ops
+reference the SAVE address; the runtime eager path uses the LOAD address.
+
+**RESOLUTION (confirmed 2026-09-01).** The exact divergence: the DeepEP
+buffer was created at different VMM addresses on SAVE (lazily, mid-warmup
+pass, after rank-asymmetric JIT/activation allocations) vs LOAD
+(bootstrap_deepep_buffer, in isolation). Cursor logs prove it: with the fix,
+both modes create the buffer at 120468799488 -> 122398179328 on both ranks;
+before the fix, LOAD's bootstrap landed at the 122398179328 point while
+SAVE's warmup-lazy creation landed elsewhere (rank-dependent). One-sided
+NVSHMEM traffic and graph-referenced addresses used the SAVE-time address
+while the runtime used the LOAD-time one; whichever eager tensor later
+reused the stale VA got corrupted (logits-path tensors by default).
+
+**Fix** (hooks.py, no dummy forwards): run `bootstrap_deepep_buffer` BEFORE
+the SAVE-side warmup pass, so the buffer is created at the same
+allocation-sequence point in both modes and its address matches by
+construction. Archives must be RE-SAVED (baked addresses change).
+`torch.cuda.empty_cache()` after graph load was also added as allocator
+hygiene. Validated: the repro sequence is fully clean, first token
+`<think>` at logprob ~0.0, DP2 regression clean.
+
+**Follow-up.** Add a token-parity check (fixed prompt set, temp 0,
+logprobs) to the validation recipe so LOAD-vs-baseline divergence is caught
+routinely.
 
 Repro: `experimental/expert-parallel/serve_sglang_qwen_30b_a3b.sh 2 --load`,
 then two chat requests, temp 0: `"What is 15 - 6? Answer briefly."` — the
