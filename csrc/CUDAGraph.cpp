@@ -26,7 +26,7 @@
 #include "hook.h"
 #include "BinaryGraphFormat.h"
 
-// #define FOUNDRY_DEBUG_REPLAY  // Uncomment for verbose on-demand replay logging
+// #define FOUNDRY_DEBUG  // Verbose logging (see README "Debugging"); same flag as hook.cpp
 
 namespace at {
 #pragma GCC diagnostic push
@@ -334,17 +334,19 @@ void CUDAGraph::replay() {
   // forward step rather than stalling steady-state decode.
   if (on_demand_data_) {
     auto& shared = on_demand_data_->shared_exec;
-#ifdef FOUNDRY_DEBUG_REPLAY
+#ifdef FOUNDRY_DEBUG
     fprintf(stderr,
             "[foundry REPLAY] graph %d (%s): current_params_id=%d, shared_exec=%p, updates=%zu\n",
             on_demand_data_->graph_id, on_demand_data_->graph_name.c_str(),
             shared->current_params_id, (void*)shared.get(), on_demand_data_->updates.size());
 #endif
     if (shared->current_params_id != on_demand_data_->graph_id) {
+#ifdef FOUNDRY_DEBUG
       int prev_id = shared->current_params_id;
+      auto t0 = std::chrono::steady_clock::now();
+#endif
       // The shared exec may be executing — drain before mutating it.
       AT_CUDA_CHECK(cudaDeviceSynchronize());
-      auto t0 = std::chrono::steady_clock::now();
       for (size_t i = 0; i < on_demand_data_->updates.size(); ++i) {
         auto& u = on_demand_data_->updates[i];
         CUgraphNode node = shared->ordered_nodes[i];
@@ -453,14 +455,16 @@ void CUDAGraph::replay() {
       }
 
       shared->current_params_id = on_demand_data_->graph_id;
+#ifdef FOUNDRY_DEBUG
       double update_us =
           std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
       fprintf(stderr,
               "[foundry ON-DEMAND] graph %d (%s): updated %zu nodes in %.1f us (prev graph %d)\n",
               on_demand_data_->graph_id, on_demand_data_->graph_name.c_str(),
               on_demand_data_->updates.size(), update_us, prev_id);
+#endif
     } else {
-#ifdef FOUNDRY_DEBUG_REPLAY
+#ifdef FOUNDRY_DEBUG
       fprintf(stderr, "[foundry REPLAY] graph %d (%s): SKIPPED update (already current)\n",
               on_demand_data_->graph_id, on_demand_data_->graph_name.c_str());
 #endif
@@ -470,19 +474,19 @@ void CUDAGraph::replay() {
     for (auto& [generator_state, wholegraph_increments] : captured_generator_states_) {
       generator_state->replay_prologue(wholegraph_increments);
     }
-#ifdef FOUNDRY_DEBUG_REPLAY
+#ifdef FOUNDRY_DEBUG
     fprintf(stderr, "[foundry DEBUG] graph %d: launching on stream %p...\n",
             on_demand_data_->graph_id, (void*)at::cuda::getCurrentCUDAStream().stream());
 #endif
     AT_CUDA_CHECK(cudaGraphLaunch(reinterpret_cast<cudaGraphExec_t>(shared->exec),
                                   at::cuda::getCurrentCUDAStream()));
-#ifdef FOUNDRY_DEBUG_REPLAY
+#ifdef FOUNDRY_DEBUG
     fprintf(stderr, "[foundry DEBUG] graph %d: launched (async)\n", on_demand_data_->graph_id);
 #endif
     return;
   }
 
-#ifdef FOUNDRY_DEBUG_REPLAY
+#ifdef FOUNDRY_DEBUG
   fprintf(stderr, "[foundry DEBUG] replay: NO on_demand_data_, using direct exec path\n");
 #endif
 

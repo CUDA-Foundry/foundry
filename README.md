@@ -122,6 +122,13 @@ pip install torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0 --index-url htt
 pip install -e . --no-build-isolation
 ```
 
+### Debugging
+
+Verbose C++ logging (allocator hook and graph replay) is gated behind a
+single compile-time flag, `FOUNDRY_DEBUG`. Uncomment the
+`// #define FOUNDRY_DEBUG` line at the top of `csrc/hook.cpp` or
+`csrc/CUDAGraph.cpp` (or build with `-DFOUNDRY_DEBUG`) and reinstall.
+
 ## Quick Start
 
 ### Graph Capture and Save
@@ -137,7 +144,7 @@ device = torch.device('cuda:0')
 torch.set_default_device(device)
 
 # Set up VMM allocation region for deterministic memory addresses
-BASE_ADDR = 0x7f0000000000
+BASE_ADDR = 0x400000000000
 region_size = fdry.parse_size('1GB')
 fdry.set_allocation_region(BASE_ADDR, region_size)
 
@@ -182,7 +189,7 @@ torch.set_default_device(device)
 fdry.load_cuda_modules_and_libraries('hook_archive')
 
 # Set up the same allocation region as capture
-BASE_ADDR = 0x7f0000000000
+BASE_ADDR = 0x400000000000
 region_size = fdry.parse_size('1GB')
 fdry.set_allocation_region(BASE_ADDR, region_size)
 

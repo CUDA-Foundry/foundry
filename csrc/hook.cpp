@@ -4,7 +4,7 @@
 #endif
 
 // Enable debug logging to trace memory allocations (uncomment for debugging)
-// #define HOOK_DEBUG
+// #define FOUNDRY_DEBUG  // Verbose logging (see README "Debugging"); same flag as CUDAGraph.cpp
 
 #include <dlfcn.h>
 #include <cstdio>
@@ -620,7 +620,7 @@ static void dump_fatbin_and_info(const void* data_ptr, std::string_view func_nam
       for (void** ptr = fatbin_array; *ptr != nullptr; ptr++) {
         num_fatbins++;
       }
-#ifdef HOOK_DEBUG
+#ifdef FOUNDRY_DEBUG
       fprintf(stderr, "[HOOK] DEBUG: FATBINC_LINK_VERSION wrapper has %zu fatbin entries\n",
               num_fatbins);
 #endif
@@ -634,7 +634,7 @@ static void dump_fatbin_and_info(const void* data_ptr, std::string_view func_nam
         for (size_t i = 0; i < num_fatbins; i++) {
           const uint8_t* fb_data = static_cast<const uint8_t*>(fatbin_array[i]);
           size_t fb_size = compute_fatbin_size(fb_data);
-#ifdef HOOK_DEBUG
+#ifdef FOUNDRY_DEBUG
           fprintf(stderr, "[HOOK] DEBUG:   fatbin[%zu] size: %zu bytes\n", i, fb_size);
 #endif
           // Store each segment separately
@@ -645,7 +645,7 @@ static void dump_fatbin_and_info(const void* data_ptr, std::string_view func_nam
         // Point to the concatenated buffer for hash computation
         binary_data = concatenated_fatbin.data();
         total_size = concatenated_fatbin.size();
-#ifdef HOOK_DEBUG
+#ifdef FOUNDRY_DEBUG
         fprintf(
             stderr,
             "[HOOK] DEBUG: Total size for %zu linked fatbins: %zu bytes (will use device linker)\n",
@@ -743,7 +743,7 @@ static void dump_fatbin_and_info(const void* data_ptr, std::string_view func_nam
   if (!linked_fatbin_segments.empty()) {
     metadata.binary_flags |= BINARY_FLAG_NEEDS_DEVICE_LINK;
     metadata.linked_fatbin_segments = std::move(linked_fatbin_segments);
-#ifdef HOOK_DEBUG
+#ifdef FOUNDRY_DEBUG
     fprintf(stderr, "[HOOK] DEBUG: Stored %zu fatbin segments for device linking (hash %016llx)\n",
             metadata.linked_fatbin_segments.size(), (unsigned long long)hash);
 #endif
@@ -1044,7 +1044,7 @@ static bool detect_nvshmem_requirement_for_module(CUmodule module) {
   for (const char* const* sym = NVSHMEM_DEVICE_SYMBOLS; *sym != nullptr; ++sym) {
     CUresult res = module_get_global(&ptr, &size, module, *sym);
     if (res == CUDA_SUCCESS) {
-#ifdef HOOK_DEBUG
+#ifdef FOUNDRY_DEBUG
       fprintf(stderr, "[HOOK] DEBUG: Found NVSHMEM symbol '%s' in module (ptr=%p, size=%zu)\n",
               *sym, (void*)ptr, size);
 #endif
@@ -1071,7 +1071,7 @@ static bool detect_nvshmem_requirement_for_library(CUlibrary library) {
   for (const char* const* sym = NVSHMEM_DEVICE_SYMBOLS; *sym != nullptr; ++sym) {
     CUresult res = library_get_global(&ptr, &size, library, *sym);
     if (res == CUDA_SUCCESS) {
-#ifdef HOOK_DEBUG
+#ifdef FOUNDRY_DEBUG
       fprintf(stderr, "[HOOK] DEBUG: Found NVSHMEM symbol '%s' in library (ptr=%p, size=%zu)\n",
               *sym, (void*)ptr, size);
 #endif
@@ -1107,7 +1107,7 @@ static void dump_module_or_library_entrypoints(std::variant<CUmodule, CUlibrary>
       fprintf(stderr, "[HOOK] FATAL ERROR: cuLibraryGetKernelCount failed with error %d\n", res);
       abort();
     }
-#ifdef HOOK_DEBUG
+#ifdef FOUNDRY_DEBUG
     fprintf(stderr,
             "[HOOK] DEBUG: dump_module_or_library_entrypoints for hash %016llx: kernel_count=%u\n",
             (unsigned long long)hash, kernel_count);
@@ -1138,7 +1138,7 @@ static void dump_module_or_library_entrypoints(std::variant<CUmodule, CUlibrary>
 
     // Detect NVSHMEM requirement at SAVE time by probing for NVSHMEM device symbols
     requires_nvshmem = detect_nvshmem_requirement_for_library(library);
-#ifdef HOOK_DEBUG
+#ifdef FOUNDRY_DEBUG
     if (requires_nvshmem) {
       fprintf(stderr, "[HOOK] DEBUG: Library hash %016llx requires NVSHMEM initialization\n",
               (unsigned long long)hash);
@@ -1191,7 +1191,7 @@ static void dump_module_or_library_entrypoints(std::variant<CUmodule, CUlibrary>
 
     // Detect NVSHMEM requirement at SAVE time by probing for NVSHMEM device symbols
     requires_nvshmem = detect_nvshmem_requirement_for_module(module);
-#ifdef HOOK_DEBUG
+#ifdef FOUNDRY_DEBUG
     if (requires_nvshmem) {
       fprintf(stderr, "[HOOK] DEBUG: Module hash %016llx requires NVSHMEM initialization\n",
               (unsigned long long)hash);
@@ -1240,14 +1240,14 @@ static void maybe_init_nvshmem_for_module(CUmodule module, uint64_t hash, bool r
   if (!nvshmem_auto_init_enabled.load()) {
     std::lock_guard<std::mutex> lock(pending_nvshmem_mutex);
     pending_nvshmem_init.push_back({hash, module});
-#ifdef HOOK_DEBUG
+#ifdef FOUNDRY_DEBUG
     fprintf(stderr, "[HOOK] DEBUG: Added module hash %016llx to pending NVSHMEM init list\n",
             (unsigned long long)hash);
 #endif
     return;
   }
 
-#ifdef HOOK_DEBUG
+#ifdef FOUNDRY_DEBUG
   fprintf(stderr, "[HOOK] DEBUG: Initializing NVSHMEM for module hash %016llx\n",
           (unsigned long long)hash);
 #endif
@@ -1284,14 +1284,14 @@ static void maybe_init_nvshmem_for_library(CUlibrary library, uint64_t hash,
   if (!nvshmem_auto_init_enabled.load()) {
     std::lock_guard<std::mutex> lock(pending_nvshmem_mutex);
     pending_nvshmem_init.push_back({hash, library});
-#ifdef HOOK_DEBUG
+#ifdef FOUNDRY_DEBUG
     fprintf(stderr, "[HOOK] DEBUG: Added library hash %016llx to pending NVSHMEM init list\n",
             (unsigned long long)hash);
 #endif
     return;
   }
 
-#ifdef HOOK_DEBUG
+#ifdef FOUNDRY_DEBUG
   fprintf(stderr, "[HOOK] DEBUG: Initializing NVSHMEM for library hash %016llx\n",
           (unsigned long long)hash);
 #endif
@@ -1818,7 +1818,7 @@ static void load_cuda_library() {
     if (!cuda_driver_entry_table[i].fn_ptr) {
       // cuLibraryGetGlobal is optional (CUDA 12.0+), don't abort if not found
       if (i == CUDA_ENTRY_cuLibraryGetGlobal) {
-#ifdef HOOK_DEBUG
+#ifdef FOUNDRY_DEBUG
         fprintf(stderr, "[HOOK] DEBUG: Optional symbol %s not found (may require CUDA 12.0+)\n",
                 cuda_driver_entry_table[i].name);
 #endif
@@ -1841,7 +1841,7 @@ static void __attribute__((constructor)) init_hook() {
   const char* foundry_mode = std::getenv("FOUNDRY_MODE");
   if (foundry_mode && std::strcmp(foundry_mode, "load") == 0) {
     skip_fatbin_processing.store(true);
-#ifdef HOOK_DEBUG
+#ifdef FOUNDRY_DEBUG
     fprintf(stderr, "[HOOK] FOUNDRY_MODE=load detected, skipping fatbin processing\n");
 #endif
   }
@@ -1854,7 +1854,7 @@ static void __attribute__((destructor)) cleanup_hook() {
 extern "C" {
 
 CUresult cuModuleLoadData(CUmodule* module, const void* image) {
-#ifdef HOOK_DEBUG
+#ifdef FOUNDRY_DEBUG
   fprintf(stderr, "[HOOK] cuModuleLoadData\n");
 #endif
 
@@ -1892,7 +1892,7 @@ CUresult cuModuleLoadData(CUmodule* module, const void* image) {
 
 CUresult cuModuleLoadDataEx(CUmodule* module, const void* image, unsigned int numOptions,
                             CUjit_option* options, void** optionValues) {
-#ifdef HOOK_DEBUG
+#ifdef FOUNDRY_DEBUG
   fprintf(stderr, "[HOOK] cuModuleLoadDataEx\n");
 #endif
 
@@ -1930,7 +1930,7 @@ CUresult cuModuleLoadDataEx(CUmodule* module, const void* image, unsigned int nu
 }
 
 CUresult cuModuleLoadFatBinary(CUmodule* module, const void* fatCubin) {
-#ifdef HOOK_DEBUG
+#ifdef FOUNDRY_DEBUG
   fprintf(stderr, "[HOOK] cuModuleLoadFatBinary\n");
 #endif
 
@@ -1970,7 +1970,7 @@ CUresult cuLibraryLoadData(CUlibrary* library, const void* code, CUjit_option* j
                            void** jitOptionsValues, unsigned int numJitOptions,
                            CUlibraryOption* libraryOptions, void** libraryOptionValues,
                            unsigned int numLibraryOptions) {
-#ifdef HOOK_DEBUG
+#ifdef FOUNDRY_DEBUG
   fprintf(stderr, "[HOOK] cuLibraryLoadData\n");
 #endif
 
@@ -2010,7 +2010,7 @@ CUresult cuLibraryLoadData(CUlibrary* library, const void* code, CUjit_option* j
 }
 
 CUresult cuModuleLoad(CUmodule* module, const char* fname) {
-#ifdef HOOK_DEBUG
+#ifdef FOUNDRY_DEBUG
   fprintf(stderr, "[HOOK] cuModuleLoad\n");
 #endif
 
@@ -2050,7 +2050,7 @@ CUresult cuLibraryLoadFromFile(CUlibrary* library, const char* fileName, CUjit_o
                                void** jitOptionsValues, unsigned int numJitOptions,
                                CUlibraryOption* libraryOptions, void** libraryOptionValues,
                                unsigned int numLibraryOptions) {
-#ifdef HOOK_DEBUG
+#ifdef FOUNDRY_DEBUG
   fprintf(stderr, "[HOOK] cuLibraryLoadFromFile\n");
 #endif
 
@@ -2091,7 +2091,7 @@ CUresult cuLibraryLoadFromFile(CUlibrary* library, const char* fileName, CUjit_o
 }
 
 CUresult cuCtxCreate(CUcontext* pctx, unsigned int flags, CUdevice dev) {
-#ifdef HOOK_DEBUG
+#ifdef FOUNDRY_DEBUG
   fprintf(stderr, "[HOOK] cuCtxCreate\n");
 #endif
 
@@ -2110,7 +2110,7 @@ CUresult cuCtxCreate(CUcontext* pctx, unsigned int flags, CUdevice dev) {
 }
 
 CUresult cuCtxCreate_v2(CUcontext* pctx, unsigned int flags, CUdevice dev) {
-#ifdef HOOK_DEBUG
+#ifdef FOUNDRY_DEBUG
   fprintf(stderr, "[HOOK] cuCtxCreate_v2\n");
 #endif
 
@@ -2131,7 +2131,7 @@ CUresult cuCtxCreate_v2(CUcontext* pctx, unsigned int flags, CUdevice dev) {
 
 CUresult cuCtxCreate_v3(CUcontext* pctx, CUexecAffinityParam* paramsArray, int numParams,
                         unsigned int flags, CUdevice dev) {
-#ifdef HOOK_DEBUG
+#ifdef FOUNDRY_DEBUG
   fprintf(stderr, "[HOOK] cuCtxCreate_v3\n");
 #endif
 
@@ -2153,7 +2153,7 @@ CUresult cuCtxCreate_v3(CUcontext* pctx, CUexecAffinityParam* paramsArray, int n
 
 CUresult cuCtxCreate_v4(CUcontext* pctx, CUctxCreateParams* ctxCreateParams, unsigned int flags,
                         CUdevice dev) {
-#ifdef HOOK_DEBUG
+#ifdef FOUNDRY_DEBUG
   fprintf(stderr, "[HOOK] cuCtxCreate_v4\n");
 #endif
 
@@ -2325,7 +2325,7 @@ CUresult cuMemAlloc_v2(CUdeviceptr* dptr, size_t bytesize) {
       hook_alloc_events.push_back(event);
     }
 
-#ifdef HOOK_DEBUG
+#ifdef FOUNDRY_DEBUG
     fprintf(stderr, "[HOOK] cuMemAlloc_v2 (FAST PATH) ptr=%llu size=%zu aligned_size=%zu\n",
             (unsigned long long)*dptr, bytesize, aligned_size);
 #endif
@@ -2458,7 +2458,7 @@ CUresult cuMemAlloc_v2(CUdeviceptr* dptr, size_t bytesize) {
     hook_alloc_events.push_back(event);
   }
 
-#ifdef HOOK_DEBUG
+#ifdef FOUNDRY_DEBUG
   fprintf(stderr, "[HOOK] cuMemAlloc_v2 (SLOW PATH) ptr=%llu size=%zu aligned_size=%zu\n",
           (unsigned long long)*dptr, bytesize, aligned_size);
 #endif
@@ -2541,7 +2541,7 @@ CUresult cuMemAllocPitch_v2(CUdeviceptr* dptr, size_t* pPitch, size_t WidthInByt
       hook_alloc_events.push_back(event);
     }
 
-#ifdef HOOK_DEBUG
+#ifdef FOUNDRY_DEBUG
     fprintf(stderr,
             "[HOOK] cuMemAllocPitch_v2 (FAST PATH) ptr=%llu pitch=%zu size=%zu aligned_size=%zu\n",
             (unsigned long long)*dptr, pitch, total_size, aligned_size);
@@ -2640,7 +2640,7 @@ CUresult cuMemAllocPitch_v2(CUdeviceptr* dptr, size_t* pPitch, size_t WidthInByt
     hook_alloc_events.push_back(event);
   }
 
-#ifdef HOOK_DEBUG
+#ifdef FOUNDRY_DEBUG
   fprintf(stderr,
           "[HOOK] cuMemAllocPitch_v2 (SLOW PATH) ptr=%llu pitch=%zu size=%zu aligned_size=%zu\n",
           (unsigned long long)*dptr, pitch, total_size, aligned_size);
@@ -2696,7 +2696,7 @@ CUresult cuMemFree_v2(CUdeviceptr dptr) {
       hook_alloc_events.push_back(event);
     }
 
-#ifdef HOOK_DEBUG
+#ifdef FOUNDRY_DEBUG
     fprintf(stderr, "[HOOK] cuMemFree_v2 ptr=%llu size=%zu (%s)\n", (unsigned long long)dptr,
             metadata.size, metadata.from_preallocation ? "PREALLOCATED" : "VMM");
 #endif
@@ -2728,7 +2728,7 @@ CUresult cuMemAddressReserve(CUdeviceptr* ptr, size_t size, size_t alignment, CU
 
   if (addr != 0) {
     CUresult result = real_func(ptr, size, alignment, addr, flags);
-#ifdef HOOK_DEBUG
+#ifdef FOUNDRY_DEBUG
     fprintf(stderr,
             "[HOOK] cuMemAddressReserve ptr=0x%llx size=0x%zx alignment=0x%zx addr=0x%llx "
             "(user-specified)\n",
@@ -2767,7 +2767,7 @@ CUresult cuMemAddressReserve(CUdeviceptr* ptr, size_t size, size_t alignment, CU
       hook_alloc_events.push_back(event);
     }
 
-#ifdef HOOK_DEBUG
+#ifdef FOUNDRY_DEBUG
     fprintf(stderr,
             "[HOOK] cuMemAddressReserve ptr=0x%llx size=0x%zx alignment=0x%zx (carved from "
             "reserved region), next_alloc_base=0x%llx\n",
@@ -2796,7 +2796,7 @@ CUresult cuMemAddressReserve(CUdeviceptr* ptr, size_t size, size_t alignment, CU
 
   tls_storage.current_vmm_reserve_addr = align_to(*ptr + size, alignment);
 
-#ifdef HOOK_DEBUG
+#ifdef FOUNDRY_DEBUG
   fprintf(stderr,
           "[HOOK] cuMemAddressReserve ptr=0x%llx size=0x%zx alignment=0x%zx (large alloc, VMM "
           "hint), next_vmm_reserve=0x%llx\n",
@@ -2819,7 +2819,7 @@ CUresult cuMemAddressFree(CUdeviceptr ptr, size_t size) {
     global_carved_reserve_metadata.erase_if(
         [ptr](const std::pair<const CUdeviceptr, size_t>& kv) { return kv.first == ptr; });
 
-#ifdef HOOK_DEBUG
+#ifdef FOUNDRY_DEBUG
     fprintf(
         stderr,
         "[HOOK] cuMemAddressFree ptr=0x%llx size=0x%zx (carved reservation, skipped real free)\n",
@@ -2828,7 +2828,7 @@ CUresult cuMemAddressFree(CUdeviceptr ptr, size_t size) {
     return CUDA_SUCCESS;
   }
 
-#ifdef HOOK_DEBUG
+#ifdef FOUNDRY_DEBUG
   fprintf(
       stderr,
       "[HOOK] cuMemAddressFree ptr=0x%llx size=0x%zx (real reservation, forwarding to driver)\n",
@@ -3260,7 +3260,7 @@ CUresult cuIpcGetMemHandle(CUipcMemHandle* pHandle, CUdeviceptr dptr) {
     memcpy(pHandle->reserved + 32, &chunk_base, sizeof(uint64_t));
     memcpy(pHandle->reserved + 40, &chunk_size, sizeof(uint64_t));
 
-#ifdef HOOK_DEBUG
+#ifdef FOUNDRY_DEBUG
     fprintf(stderr,
             "[HOOK] cuIpcGetMemHandle: VMM ptr=0x%llx, fd=%d (served via socket), size=%zu\n",
             (unsigned long long)dptr, fd, metadata.size);
@@ -3319,7 +3319,7 @@ CUresult cuIpcOpenMemHandle(CUdeviceptr* pdptr, CUipcMemHandle handle, unsigned 
       }
     }
 
-#ifdef HOOK_DEBUG
+#ifdef FOUNDRY_DEBUG
     fprintf(stderr,
             "[HOOK] cuIpcOpenMemHandle: VMM exporter_pid=%d, original_ptr=0x%llx, size=%zu\n",
             (int)exporter_pid, (unsigned long long)original_ptr, size);
@@ -3525,7 +3525,7 @@ CUresult cuIpcOpenMemHandle(CUdeviceptr* pdptr, CUipcMemHandle handle, unsigned 
     alloc_metadata.from_preallocation = false;
     global_alloc_metadata.emplace(mapped_ptr, alloc_metadata);
 
-#ifdef HOOK_DEBUG
+#ifdef FOUNDRY_DEBUG
     fprintf(stderr,
             "[HOOK] cuIpcOpenMemHandle: Successfully mapped exporter ptr=0x%llx -> ptr=0x%llx, "
             "size=%zu\n",
@@ -3605,7 +3605,7 @@ CUresult cuIpcCloseMemHandle(CUdeviceptr dptr) {
     global_alloc_metadata.erase_if(
         [dptr](const std::pair<const CUdeviceptr, AllocMetadata>& kv) { return kv.first == dptr; });
 
-#ifdef HOOK_DEBUG
+#ifdef FOUNDRY_DEBUG
     fprintf(stderr, "[HOOK] cuIpcCloseMemHandle: Closed VMM IPC ptr=0x%llx\n",
             (unsigned long long)dptr);
 #endif
@@ -3641,7 +3641,7 @@ void set_allocation_region(void* base, size_t size) {
     tls_storage.current_alloc_base_addr = aligned_base;
     tls_storage.current_vmm_reserve_addr = align_to(aligned_base + size, kAllocAlignment);
     tls_storage.enabled = true;
-#ifdef HOOK_DEBUG
+#ifdef FOUNDRY_DEBUG
     fprintf(stderr, "[HOOK] Allocation region already set (base=%p size=%zu), re-enabled\n",
             (void*)aligned_base, size);
 #endif
@@ -3710,7 +3710,7 @@ void set_allocation_region(void* base, size_t size) {
   tls_storage.enabled = true;
   tls_storage.region_initialized = true;
 
-#ifdef HOOK_DEBUG
+#ifdef FOUNDRY_DEBUG
   fprintf(stderr, "[HOOK] Allocation region set: base=%p size=%zu, vmm_reserve_addr=%p\n",
           (void*)aligned_base, size, (void*)tls_storage.current_vmm_reserve_addr);
 #endif
@@ -3719,7 +3719,7 @@ void set_allocation_region(void* base, size_t size) {
 void stop_allocation_region() {
   tls_storage.enabled = false;
 
-#ifdef HOOK_DEBUG
+#ifdef FOUNDRY_DEBUG
   fprintf(stderr, "[HOOK] Allocation region stopped\n");
 #endif
 }
@@ -3727,7 +3727,7 @@ void stop_allocation_region() {
 void resume_allocation_region() {
   tls_storage.enabled = true;
 
-#ifdef HOOK_DEBUG
+#ifdef FOUNDRY_DEBUG
   fprintf(stderr, "[HOOK] Allocation region resumed: base=%p size=%zu\n", tls_storage.region.base,
           tls_storage.region.size);
 #endif
@@ -3956,7 +3956,7 @@ void set_current_alloc_offset(size_t offset) {
   // (outside the region) should hint — it was set to base + region_size
   // by set_allocation_region and must stay there.
 
-#ifdef HOOK_DEBUG
+#ifdef FOUNDRY_DEBUG
   fprintf(stderr, "[HOOK] Set allocation offset: 0x%llx (absolute addr: 0x%llx)\n",
           (unsigned long long)offset, (unsigned long long)new_alloc_addr);
 #endif
@@ -4067,7 +4067,7 @@ void replay_hook_events_from_json(const boost::json::object& events_obj) {
         fprintf(stderr, "[REPLAY] HINT: Try a different base_addr in your TOML config\n");
         abort();
       }
-#ifdef HOOK_DEBUG
+#ifdef FOUNDRY_DEBUG
       fprintf(stderr, "[REPLAY] OK: Allocated %zu bytes at expected address 0x%llx\n", size,
               (unsigned long long)actual_ptr);
 #endif
@@ -4090,7 +4090,7 @@ void replay_hook_events_from_json(const boost::json::object& events_obj) {
 
       tls_storage.current_alloc_base_addr = align_to(aligned_addr + size, kAllocAlignment);
 
-#ifdef HOOK_DEBUG
+#ifdef FOUNDRY_DEBUG
       fprintf(stderr, "[REPLAY] OK: Reserved %zu bytes at 0x%llx (pointer advance only)\n", size,
               (unsigned long long)aligned_addr);
 #endif
@@ -4343,7 +4343,7 @@ void load_cuda_modules_and_libraries(const std::string& archive_dir) {
       }
     }
 
-#ifdef HOOK_DEBUG
+#ifdef FOUNDRY_DEBUG
     fprintf(stderr, "[HOOK] DEBUG: No CUDA context found, creating context on device %d\n", device);
 #endif
 
@@ -4383,7 +4383,7 @@ void load_cuda_modules_and_libraries(const std::string& archive_dir) {
       abort();
     }
   } else {
-#ifdef HOOK_DEBUG
+#ifdef FOUNDRY_DEBUG
     // Context already exists - log which device it's on
     typedef CUresult (*cuCtxGetDevice_t)(CUdevice*);
     auto ctx_get_device = (cuCtxGetDevice_t)real_dlsym(RTLD_NEXT, "cuCtxGetDevice");
@@ -4459,7 +4459,7 @@ void load_cuda_modules_and_libraries(const std::string& archive_dir) {
           abort();
         }
 
-#ifdef HOOK_DEBUG
+#ifdef FOUNDRY_DEBUG
         fprintf(stderr, "[HOOK] DEBUG: Reading %zu linked segments for hash %016llx\n",
                 num_segments, (unsigned long long)hash);
 #endif
@@ -4480,7 +4480,7 @@ void load_cuda_modules_and_libraries(const std::string& archive_dir) {
           }
 
           entry.linked_segments.push_back(std::move(seg_data));
-#ifdef HOOK_DEBUG
+#ifdef FOUNDRY_DEBUG
           fprintf(stderr, "[HOOK] DEBUG:   segment[%zu] size: %zu bytes\n", i, seg_size);
 #endif
         }
@@ -4598,7 +4598,7 @@ void load_cuda_modules_and_libraries(const std::string& archive_dir) {
 
         if (!binary.linked_segments.empty()) {
           // Device-linked binary - use CUDA linker to combine segments (fallback path)
-#ifdef HOOK_DEBUG
+#ifdef FOUNDRY_DEBUG
           fprintf(stderr, "[HOOK] DEBUG: Using device linker for %zu segments (hash %016llx)\n",
                   binary.linked_segments.size(), (unsigned long long)binary.hash);
 #endif
@@ -4622,7 +4622,7 @@ void load_cuda_modules_and_libraries(const std::string& archive_dir) {
               link_destroy(link_state);
               abort();
             }
-#ifdef HOOK_DEBUG
+#ifdef FOUNDRY_DEBUG
             fprintf(stderr, "[HOOK] DEBUG:   Added segment %zu (%zu bytes) to linker\n", i,
                     segment.size());
 #endif
@@ -4637,7 +4637,7 @@ void load_cuda_modules_and_libraries(const std::string& archive_dir) {
             link_destroy(link_state);
             abort();
           }
-#ifdef HOOK_DEBUG
+#ifdef FOUNDRY_DEBUG
           fprintf(stderr, "[HOOK] DEBUG: Device linking complete, output size: %zu bytes\n",
                   cubin_size);
 #endif
@@ -4656,7 +4656,7 @@ void load_cuda_modules_and_libraries(const std::string& archive_dir) {
           }
         } else {
           // Regular single binary (or pre-linked cubin from SAVE mode)
-#ifdef HOOK_DEBUG
+#ifdef FOUNDRY_DEBUG
           fprintf(stderr,
                   "[HOOK] DEBUG: Loading library hash %016llx, size: %zu bytes, %zu kernels\n",
                   (unsigned long long)binary.hash, binary.data.size(), binary.entry_names.size());
