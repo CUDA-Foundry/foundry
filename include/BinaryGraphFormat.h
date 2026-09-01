@@ -35,7 +35,10 @@ namespace foundry {
 namespace binary_format {
 
 static constexpr uint8_t MAGIC[8] = {'C', 'U', 'G', 'R', 'A', 'P', 'H', '\0'};
-static constexpr uint32_t FORMAT_VERSION = 1;
+// v2: BinDependency carries CUgraphEdgeData ports/type (PDL edges).
+// v1 files remain readable (8-byte dependency records, default edges).
+static constexpr uint32_t FORMAT_VERSION = 2;
+static constexpr uint32_t MIN_SUPPORTED_VERSION = 1;
 
 enum SectionType : uint32_t {
   SECTION_STRING_TABLE = 0,
@@ -220,18 +223,31 @@ static_assert(sizeof(BinGenerator) == 24, "BinGenerator must be 24 bytes");
 
 // ---- Dependency ----
 
-struct BinDependency {
+// v1 record: default edges only.
+struct BinDependencyV1 {
   uint32_t from_id;
   uint32_t to_id;
 };
-static_assert(sizeof(BinDependency) == 8, "BinDependency must be 8 bytes");
+static_assert(sizeof(BinDependencyV1) == 8, "BinDependencyV1 must be 8 bytes");
+
+// v2 record: adds CUgraphEdgeData (programmatic/PDL ports).
+struct BinDependency {
+  uint32_t from_id;
+  uint32_t to_id;
+  uint8_t from_port;
+  uint8_t to_port;
+  uint8_t edge_type;
+  uint8_t _pad;
+};
+static_assert(sizeof(BinDependency) == 12, "BinDependency must be 12 bytes");
 
 #pragma pack(pop)
 
 // ---- Helpers ----
 
 inline bool validate_header(const FileHeader& h) {
-  return memcmp(h.magic, MAGIC, 8) == 0 && h.version == FORMAT_VERSION;
+  return memcmp(h.magic, MAGIC, 8) == 0 && h.version >= MIN_SUPPORTED_VERSION &&
+         h.version <= FORMAT_VERSION;
 }
 
 }  // namespace binary_format

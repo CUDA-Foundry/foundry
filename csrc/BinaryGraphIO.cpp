@@ -270,7 +270,20 @@ void CUDAGraph::save_binary(const std::string& bin_path, const boost::json::obje
   deps.reserve(deps_array.size());
   for (const auto& dep_val : deps_array) {
     const json::object& d = dep_val.as_object();
-    deps.push_back({d.at("from").to_number<uint32_t>(), d.at("to").to_number<uint32_t>()});
+    bf::BinDependency bd{};
+    bd.from_id = d.at("from").to_number<uint32_t>();
+    bd.to_id = d.at("to").to_number<uint32_t>();
+    // Edge data (PDL programmatic ports); absent fields = default edge.
+    if (auto* v = d.if_contains("from_port")) {
+      bd.from_port = (uint8_t)v->to_number<int>();
+    }
+    if (auto* v = d.if_contains("to_port")) {
+      bd.to_port = (uint8_t)v->to_number<int>();
+    }
+    if (auto* v = d.if_contains("edge_type")) {
+      bd.edge_type = (uint8_t)v->to_number<int>();
+    }
+    deps.push_back(bd);
   }
 
   // ---- Generators ----
@@ -653,14 +666,34 @@ boost::json::value read_and_parse_binary_graph(const std::string& bin_path) {
   // Dependencies
   if (header.flags & bf::FLAG_HAS_DEPENDENCIES) {
     auto [dep_data, dep_size] = section(bf::SECTION_DEPENDENCY_TABLE);
-    const bf::BinDependency* deps = reinterpret_cast<const bf::BinDependency*>(dep_data);
     json::array deps_array;
     deps_array.reserve(header.num_dependencies);
-    for (uint32_t i = 0; i < header.num_dependencies; i++) {
-      json::object d;
-      d["from"] = deps[i].from_id;
-      d["to"] = deps[i].to_id;
-      deps_array.push_back(d);
+    if (header.version >= 2) {
+      const bf::BinDependency* deps = reinterpret_cast<const bf::BinDependency*>(dep_data);
+      for (uint32_t i = 0; i < header.num_dependencies; i++) {
+        json::object d;
+        d["from"] = deps[i].from_id;
+        d["to"] = deps[i].to_id;
+        if (deps[i].from_port != 0) {
+          d["from_port"] = deps[i].from_port;
+        }
+        if (deps[i].to_port != 0) {
+          d["to_port"] = deps[i].to_port;
+        }
+        if (deps[i].edge_type != 0) {
+          d["edge_type"] = deps[i].edge_type;
+        }
+        deps_array.push_back(d);
+      }
+    } else {
+      // v1: 8-byte records, default edges only.
+      const bf::BinDependencyV1* deps = reinterpret_cast<const bf::BinDependencyV1*>(dep_data);
+      for (uint32_t i = 0; i < header.num_dependencies; i++) {
+        json::object d;
+        d["from"] = deps[i].from_id;
+        d["to"] = deps[i].to_id;
+        deps_array.push_back(d);
+      }
     }
     root["dependencies"] = std::move(deps_array);
   }

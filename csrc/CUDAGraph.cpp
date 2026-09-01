@@ -328,7 +328,10 @@ void CUDAGraph::instantiate() {
 }
 
 void CUDAGraph::replay() {
-  // On-demand replay: update shared graph nodes + cuGraphExecUpdate, then launch.
+  // On-demand replay: update shared graph nodes + cuGraphExecUpdate, then
+  // launch. The exec update is intentionally kept on the shared exec — the
+  // engine schedules one step ahead, so the update overlaps the in-flight
+  // forward step rather than stalling steady-state decode.
   if (on_demand_data_) {
     auto& shared = on_demand_data_->shared_exec;
 #ifdef FOUNDRY_DEBUG_REPLAY
@@ -339,10 +342,7 @@ void CUDAGraph::replay() {
 #endif
     if (shared->current_params_id != on_demand_data_->graph_id) {
       int prev_id = shared->current_params_id;
-#ifdef FOUNDRY_DEBUG_REPLAY
-      fprintf(stderr, "[foundry DEBUG] graph %d: syncing before on-demand update (prev %d)...\n",
-              on_demand_data_->graph_id, prev_id);
-#endif
+      // The shared exec may be executing — drain before mutating it.
       AT_CUDA_CHECK(cudaDeviceSynchronize());
       auto t0 = std::chrono::steady_clock::now();
       for (size_t i = 0; i < on_demand_data_->updates.size(); ++i) {
@@ -435,7 +435,7 @@ void CUDAGraph::replay() {
             break;
         }
       }
-      // Apply all graph node changes to the exec in bulk
+      // Apply all graph node changes to the exec in bulk.
       CUgraphExecUpdateResultInfo resultInfo = {};
       CUresult update_result = cuGraphExecUpdate(shared->exec, shared->graph, &resultInfo);
       if (update_result != CUDA_SUCCESS) {
