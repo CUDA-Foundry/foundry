@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import time
+from types import SimpleNamespace
 from typing import Any
 
 import torch
@@ -259,37 +260,51 @@ def initialize_attention_metadata_for_bs(cuda_graph_runner, bs: int) -> None:
     """
     buffers = cuda_graph_runner.buffers
     attn_backend = cuda_graph_runner.attn_backend
-    if not hasattr(attn_backend, "_prepare_cuda_graph_metadata"):
-        # sglang >= 0.5.12 removed the fused per-bs capture init this
-        # pre-pass was built on; only the FlashInfer backend is ported so
-        # far (its split allocation/planner API is replicated below).
-        raise RuntimeError(
-            "[foundry] attention-metadata pre-pass is not ported to "
-            f"{type(attn_backend).__name__} on this sglang version"
-        )
     num_tokens = bs * cuda_graph_runner.num_tokens_per_bs
     encoder_lens = buffers.encoder_lens[:bs] if cuda_graph_runner.is_encoder_decoder else None
     spec_info = cuda_graph_runner.get_spec_info(num_tokens)
     forward_mode = cuda_graph_runner.capture_forward_mode
-    # Allocation half (wrappers + _int_workspace_buffer).
-    attn_backend._prepare_cuda_graph_metadata(bs, num_tokens, forward_mode, spec_info)
-    # Planner half, mirroring init_forward_metadata_out_graph's decode
-    # branch. The old fused init ran it too; keeping it in the pre-pass
-    # keeps any plan-time allocations at the same VMM cursor position on
-    # SAVE and LOAD.
-    if forward_mode.is_decode_or_idle():
-        seq_lens = buffers.seq_lens[:bs]
-        attn_backend.indices_updater_decode.update(
-            buffers.req_pool_indices[:bs],
-            seq_lens,
-            buffers.seq_lens_cpu[:bs],
-            seq_lens.sum().item(),
-            decode_wrappers=attn_backend.decode_cuda_graph_metadata[bs],
-            encoder_lens=encoder_lens,
-            spec_info=spec_info,
-            fixed_split_size=None,
-            disable_split_kv=attn_backend.disable_cuda_graph_kv_split,
-        )
+
+    if hasattr(attn_backend, "_prepare_cuda_graph_metadata"):
+        # FlashInfer. Allocation half (wrappers + _int_workspace_buffer),
+        # then the planner half mirroring init_forward_metadata_out_graph's
+        # decode branch. The old fused init ran both; keeping the planner in
+        # the pre-pass keeps any plan-time allocations at the same VMM
+        # cursor position on SAVE and LOAD.
+        attn_backend._prepare_cuda_graph_metadata(bs, num_tokens, forward_mode, spec_info)
+        if forward_mode.is_decode_or_idle():
+            seq_lens = buffers.seq_lens[:bs]
+            attn_backend.indices_updater_decode.update(
+                buffers.req_pool_indices[:bs],
+                seq_lens,
+                buffers.seq_lens_cpu[:bs],
+                seq_lens.sum().item(),
+                decode_wrappers=attn_backend.decode_cuda_graph_metadata[bs],
+                encoder_lens=encoder_lens,
+                spec_info=spec_info,
+                fixed_split_size=None,
+                disable_split_kv=attn_backend.disable_cuda_graph_kv_split,
+            )
+        return
+
+    # Other backends (fa3 etc.): drive the public capture-time entry point
+    # with a duck-typed batch carrying exactly the fields
+    # init_forward_metadata_out_graph reads. These backends' per-bs metadata
+    # are views over the fixed init_cuda_graph_state workspace (not graph
+    # memory), so this runs after load without moving the VMM cursor.
+    fb = SimpleNamespace(
+        forward_mode=forward_mode,
+        batch_size=bs,
+        req_pool_indices=buffers.req_pool_indices[:bs],
+        seq_lens=buffers.seq_lens[:bs],
+        seq_lens_cpu=buffers.seq_lens_cpu[:bs],
+        seq_lens_sum=int(buffers.seq_lens[:bs].sum().item()),
+        encoder_lens=encoder_lens,
+        spec_info=spec_info,
+        out_cache_loc=buffers.out_cache_loc[:num_tokens],
+        positions=buffers.positions[:num_tokens],
+    )
+    attn_backend.init_forward_metadata_out_graph(fb, in_capture=True)
 
 
 def initialize_all_attention_metadata(cuda_graph_runner) -> None:

@@ -422,7 +422,9 @@ def _patch_cuda_graph_capture() -> None:
             # FlashInfer by its per-bs indices_updater_decode.
             attn_backend = self.attn_backend
             use_fi_prepass = hasattr(attn_backend, "indices_updater_decode")
-            real_prepare = attn_backend._prepare_cuda_graph_metadata
+            # FlashInfer-only attribute — grab it only when the shim applies
+            # (fa3 etc. have no _prepare_cuda_graph_metadata and no pre-pass).
+            real_prepare = getattr(attn_backend, "_prepare_cuda_graph_metadata", None)
 
             def reuse_pre_pass_prepare(bs, num_tokens, forward_mode, spec_info):
                 # The pre-pass already allocated the wrappers for this bs and
@@ -475,7 +477,8 @@ def _patch_cuda_graph_capture() -> None:
             try:
                 result = orig_capture(self, *args, **kwargs)
             finally:
-                attn_backend._prepare_cuda_graph_metadata = real_prepare
+                if use_fi_prepass:
+                    attn_backend._prepare_cuda_graph_metadata = real_prepare
 
             from foundry.integration.sglang.graph_ops import (
                 pack_fatbins,
