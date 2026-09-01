@@ -375,9 +375,9 @@ def _patch_cuda_graph_capture() -> None:
             rt.log_alloc_offset("after_preallocate")
             # Pre-pass: allocate every per-bs FlashInfer wrapper in
             # ``reversed(capture_bs)`` order, matching the order SAVE used.
-            # SAVE's patched ``init_forward_metadata_capture_cuda_graph``
-            # is idempotent so the inner per-iter call inside the SAVE
-            # capture loop does not re-allocate. Same upfront allocation
+            # SAVE's patched ``_prepare_cuda_graph_metadata`` reuses these
+            # allocations, so the per-iter call inside the SAVE capture
+            # loop does not re-allocate. Same upfront allocation
             # sequence on both sides → cursor sits at SAVE's
             # ``start_base_addr_0`` when graph load begins.
             # FlashInfer-only pre-pass (see SAVE branch). fa3 etc. allocate their
@@ -422,28 +422,19 @@ def _patch_cuda_graph_capture() -> None:
             # FlashInfer by its per-bs indices_updater_decode.
             attn_backend = self.attn_backend
             use_fi_prepass = hasattr(attn_backend, "indices_updater_decode")
-            real_init = attn_backend.init_forward_metadata_capture_cuda_graph
+            real_prepare = attn_backend._prepare_cuda_graph_metadata
 
-            def reuse_pre_pass_init(
-                bs,
-                num_tokens,
-                req_pool_indices,
-                seq_lens,
-                encoder_lens,
-                forward_mode,
-                spec_info,
-            ):
-                # The pre-pass already allocated a wrapper for this
-                # bs and stored it in
-                # ``decode_cuda_graph_metadata`` /
-                # ``prefill_cuda_graph_metadata``. Reuse it directly
-                # — no second torch.empty for ``_int_workspace_buffer``.
-                # Re-run the planner with the same buffer slices the
-                # capture forward uses, then point
-                # ``forward_metadata`` at the same wrappers. Same
-                # plan call on LOAD via the symmetric pre-pass, so
-                # the captured graph kernels reference VMM addresses
-                # that LOAD's wrappers actually occupy.
+            def reuse_pre_pass_prepare(bs, num_tokens, forward_mode, spec_info):
+                # The pre-pass already allocated the wrappers for this bs and
+                # stored them in ``decode_cuda_graph_metadata`` /
+                # ``prefill_cuda_graph_metadata`` — reuse them instead of
+                # re-allocating (no second torch.empty for
+                # ``_int_workspace_buffer``), keeping the VMM cursor
+                # deterministic vs LOAD. sglang >= 0.5.12 split the old fused
+                # ``init_forward_metadata_capture_cuda_graph`` into this
+                # allocation half and the planner half
+                # (``init_forward_metadata_out_graph``), which now runs
+                # upstream against the reused wrappers.
                 from sglang.srt.layers.attention.flashinfer_backend import (
                     DecodeMetadata,
                     PrefillMetadata,
@@ -451,77 +442,21 @@ def _patch_cuda_graph_capture() -> None:
 
                 if forward_mode.is_decode_or_idle():
                     wrappers = attn_backend.decode_cuda_graph_metadata.get(bs)
-                    if wrappers is None:
-                        return real_init(
-                            bs,
-                            num_tokens,
-                            req_pool_indices,
-                            seq_lens,
-                            encoder_lens,
-                            forward_mode,
-                            spec_info,
-                        )
-                    seq_lens_sum = seq_lens.sum().item()
-                    attn_backend.indices_updater_decode.update(
-                        req_pool_indices,
-                        seq_lens,
-                        seq_lens.cpu(),
-                        seq_lens_sum,
-                        decode_wrappers=wrappers,
-                        encoder_lens=encoder_lens,
-                        spec_info=spec_info,
-                        fixed_split_size=None,
-                        disable_split_kv=attn_backend.disable_cuda_graph_kv_split,
-                    )
-                    attn_backend.forward_metadata = DecodeMetadata(wrappers)
-                    return
-                if (
+                    if wrappers is not None:
+                        attn_backend.forward_metadata = DecodeMetadata(wrappers)
+                        return
+                elif (
                     forward_mode.is_target_verify()
                     or forward_mode.is_draft_extend()
                     or forward_mode.is_dllm_extend()
                 ):
                     wrappers = attn_backend.prefill_cuda_graph_metadata.get(bs)
-                    if wrappers is None:
-                        return real_init(
-                            bs,
-                            num_tokens,
-                            req_pool_indices,
-                            seq_lens,
-                            encoder_lens,
-                            forward_mode,
-                            spec_info,
+                    if wrappers is not None:
+                        attn_backend.forward_metadata = PrefillMetadata(
+                            wrappers, forward_mode.is_dllm_extend(), False
                         )
-                    seq_lens_sum = seq_lens.sum().item()
-                    use_ragged = forward_mode.is_dllm_extend()
-                    prefix_lens = (
-                        seq_lens - attn_backend.dllm_config.block_size
-                        if forward_mode.is_dllm_extend()
-                        else None
-                    )
-                    spec_info_arg = None if forward_mode.is_dllm_extend() else spec_info
-                    attn_backend.indices_updater_prefill.update(
-                        req_pool_indices,
-                        seq_lens,
-                        seq_lens.cpu(),
-                        seq_lens_sum,
-                        prefix_lens=prefix_lens,
-                        prefill_wrappers=wrappers,
-                        use_ragged=use_ragged,
-                        encoder_lens=encoder_lens,
-                        spec_info=spec_info_arg,
-                    )
-                    attn_backend.forward_metadata = PrefillMetadata(wrappers, use_ragged, False)
-                    return
-                # Unknown mode — fall back to real init.
-                return real_init(
-                    bs,
-                    num_tokens,
-                    req_pool_indices,
-                    seq_lens,
-                    encoder_lens,
-                    forward_mode,
-                    spec_info,
-                )
+                        return
+                return real_prepare(bs, num_tokens, forward_mode, spec_info)
 
             if use_fi_prepass:
                 from foundry.integration.sglang.graph_ops import (
@@ -536,11 +471,11 @@ def _patch_cuda_graph_capture() -> None:
                 # Drop the pre-pass's last forward_metadata ref so popping the dict
                 # entry doesn't keep the wrapper alive at refcount 1.
                 attn_backend.forward_metadata = None
-                attn_backend.init_forward_metadata_capture_cuda_graph = reuse_pre_pass_init
+                attn_backend._prepare_cuda_graph_metadata = reuse_pre_pass_prepare
             try:
                 result = orig_capture(self, *args, **kwargs)
             finally:
-                attn_backend.init_forward_metadata_capture_cuda_graph = real_init
+                attn_backend._prepare_cuda_graph_metadata = real_prepare
 
             from foundry.integration.sglang.graph_ops import (
                 pack_fatbins,

@@ -258,18 +258,38 @@ def initialize_attention_metadata_for_bs(cuda_graph_runner, bs: int) -> None:
     at deterministic VMM addresses.
     """
     buffers = cuda_graph_runner.buffers
+    attn_backend = cuda_graph_runner.attn_backend
+    if not hasattr(attn_backend, "_prepare_cuda_graph_metadata"):
+        # sglang >= 0.5.12 removed the fused per-bs capture init this
+        # pre-pass was built on; only the FlashInfer backend is ported so
+        # far (its split allocation/planner API is replicated below).
+        raise RuntimeError(
+            "[foundry] attention-metadata pre-pass is not ported to "
+            f"{type(attn_backend).__name__} on this sglang version"
+        )
     num_tokens = bs * cuda_graph_runner.num_tokens_per_bs
     encoder_lens = buffers.encoder_lens[:bs] if cuda_graph_runner.is_encoder_decoder else None
     spec_info = cuda_graph_runner.get_spec_info(num_tokens)
-    cuda_graph_runner.attn_backend.init_forward_metadata_capture_cuda_graph(
-        bs,
-        num_tokens,
-        buffers.req_pool_indices[:bs],
-        buffers.seq_lens[:bs],
-        encoder_lens,
-        cuda_graph_runner.capture_forward_mode,
-        spec_info,
-    )
+    forward_mode = cuda_graph_runner.capture_forward_mode
+    # Allocation half (wrappers + _int_workspace_buffer).
+    attn_backend._prepare_cuda_graph_metadata(bs, num_tokens, forward_mode, spec_info)
+    # Planner half, mirroring init_forward_metadata_out_graph's decode
+    # branch. The old fused init ran it too; keeping it in the pre-pass
+    # keeps any plan-time allocations at the same VMM cursor position on
+    # SAVE and LOAD.
+    if forward_mode.is_decode_or_idle():
+        seq_lens = buffers.seq_lens[:bs]
+        attn_backend.indices_updater_decode.update(
+            buffers.req_pool_indices[:bs],
+            seq_lens,
+            buffers.seq_lens_cpu[:bs],
+            seq_lens.sum().item(),
+            decode_wrappers=attn_backend.decode_cuda_graph_metadata[bs],
+            encoder_lens=encoder_lens,
+            spec_info=spec_info,
+            fixed_split_size=None,
+            disable_split_kv=attn_backend.disable_cuda_graph_kv_split,
+        )
 
 
 def initialize_all_attention_metadata(cuda_graph_runner) -> None:
