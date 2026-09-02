@@ -25,7 +25,8 @@ recipe/sglang/
 ├── serve_qwen3-mini.sh             # Qwen3-1.7B           single GPU
 ├── serve_qwen3-1.7b_tp.sh          # Qwen3-1.7B           tensor parallel (symm-mem allreduce)
 ├── serve_qwen3-1.7b_dp.sh          # Qwen3-1.7B           data parallel
-└── serve_qwen3-30ba3b_ep.sh        # Qwen3-30B-A3B (MoE)  expert parallel (DeepEP)
+├── serve_qwen3-30ba3b_ep.sh        # Qwen3-30B-A3B (MoE)  expert parallel (DeepEP + DP-attention)
+└── serve_qwen3-30ba3b_ep_tpattn.sh # Qwen3-30B-A3B (MoE)  expert parallel, TP attention (symm-mem allreduce)
 ```
 
 Every script accepts the same trailing `--save` / `--load` flag. Scripts that scale
@@ -35,7 +36,8 @@ across GPUs take the parallel-size as the first positional argument:
 bash serve_qwen3-mini.sh                       [--save|--load]
 bash serve_qwen3-1.7b_tp.sh        <tp_size>   [--save|--load]
 bash serve_qwen3-1.7b_dp.sh        <dp_size>   [--save|--load]
-bash serve_qwen3-30ba3b_ep.sh   <ep_size>   [--save|--load]
+bash serve_qwen3-30ba3b_ep.sh          <ep_size>   [--save|--load]
+bash serve_qwen3-30ba3b_ep_tpattn.sh   <ep_size>   [--save|--load]
 ```
 
 The scripts use `--cuda-graph-max-bs` (deprecated alias of
@@ -55,6 +57,7 @@ model or topology before SAVE.
 | Tensor parallel | `serve_qwen3-1.7b_tp.sh` | Qwen3-1.7B | torch symm-mem allreduce (`--enable-torch-symm-mem --disable-custom-all-reduce`); mirrors the vLLM TP recipe |
 | Data parallel | `serve_qwen3-1.7b_dp.sh` | Qwen3-1.7B | one full replica/rank; `NCCL_CUMEM_ENABLE=0`/`NCCL_NVLS_ENABLE=0` |
 | Expert parallel | `serve_qwen3-30ba3b_ep.sh` | Qwen3-30B-A3B | DP-attention + DeepEP; fa3 backend; `SGL_MODEL=Qwen/Qwen3-30B-A3B-FP8` for FP8 |
+| Expert parallel, TP attention | `serve_qwen3-30ba3b_ep_tpattn.sh` | Qwen3-30B-A3B | symm-mem allreduce + DeepEP (vLLM-shaped EP); `foundry-0.5.18` branch only (per-phase cuda-graph flags) |
 
 ## Installation
 
@@ -162,15 +165,15 @@ curl -s http://0.0.0.0:12000/v1/completions -H 'Content-Type: application/json' 
   -d '{"model":"Qwen/Qwen3-30B-A3B","prompt":"The capital of France is","max_tokens":12,"temperature":0}'
 ```
 
-**EP with TP attention (symm-mem allreduce).** The default EP recipe uses
-DP-attention, which needs no allreduce in the decode graphs. The validated
-alternative that mirrors the vLLM EP topology keeps TP attention and routes its
-allreduce through torch symm-mem: replace `--dp-size <N> --enable-dp-attention`
-with `--disable-custom-all-reduce --enable-torch-symm-mem
---cuda-graph-backend-prefill disabled` (the prefill-graph disable matters even
-for baseline runs of this topology: without DP-attention every rank dispatches
-the full prefill chunk, and prefill-graph capture trips DeepEP's
-`num_max_dispatch_tokens_per_rank` assert).
+**EP with TP attention (symm-mem allreduce)** — `serve_qwen3-30ba3b_ep_tpattn.sh`.
+The default EP recipe uses DP-attention, which needs no allreduce in the decode
+graphs. This variant mirrors the vLLM EP topology instead: TP attention with its
+allreduce routed through torch symm-mem (`--enable-torch-symm-mem`, custom AR
+off) plus `--cuda-graph-backend-prefill disabled` — the prefill-graph disable
+matters even for baseline runs of this topology, because without DP-attention
+every rank dispatches the full prefill chunk and prefill-graph capture trips
+DeepEP's `num_max_dispatch_tokens_per_rank` assert. `foundry-0.5.18` branch
+only (uses the per-phase cuda-graph flags).
 
 The EP script sets `--enable-dp-attention --moe-a2a-backend deepep --deepep-mode
 low_latency --moe-runner-backend deep_gemm --attention-backend fa3
