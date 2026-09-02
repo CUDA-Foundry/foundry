@@ -1,7 +1,15 @@
 # Foundry recipe — SGLang
 
 End-to-end serve scripts for SAVE / LOAD of CUDA graphs through the foundry SGLang
-integration. All scripts in this directory share the same pair of foundry TOML files
+integration.
+
+Current target: the fork's **`foundry-0.5.18`** branch (integration rebased onto
+upstream-synced `main`, post-0.5.18), which pins **torch 2.13.0+cu130** and ships the
+whole kernel stack as wheels. Foundry `dev >= ac6104f` builds against torch 2.11 and
+2.13 alike (version-guarded csrc). Validated on this pairing: single-GPU, DP=2, and
+EP=2 (Qwen3-30B-A3B + DeepEP low-latency) save/load/query. The older `foundry`
+branch (~0.5.12 base, torch 2.11) still works with foundry `dev` — the differences
+called out below are marked with the branch they apply to. All scripts in this directory share the same pair of foundry TOML files
 (`foundry_save.toml` / `foundry_load.toml`) — pick a script for your model + parallelism,
 run `--save`, then `--load`, then query. The integration code is in
 [`../../python/foundry/integration/sglang/`](../../python/foundry/integration/sglang/);
@@ -16,7 +24,7 @@ recipe/sglang/
 ├── foundry_load.toml               # shared LOAD config (same workspace_root)
 ├── serve_qwen3-mini.sh             # Qwen3-1.7B           single GPU
 ├── serve_qwen3-1.7b_dp.sh          # Qwen3-1.7B           data parallel
-└── serve_qwen3-30ba3bfp8_ep.sh     # Qwen3-30B-A3B FP8    expert parallel (DeepEP)
+└── serve_qwen3-30ba3b_ep.sh        # Qwen3-30B-A3B (MoE)  expert parallel (DeepEP)
 ```
 
 Every script accepts the same trailing `--save` / `--load` flag. Scripts that scale
@@ -25,8 +33,12 @@ across GPUs take the parallel-size as the first positional argument:
 ```bash
 bash serve_qwen3-mini.sh                       [--save|--load]
 bash serve_qwen3-1.7b_dp.sh        <dp_size>   [--save|--load]
-bash serve_qwen3-30ba3bfp8_ep.sh   <ep_size>   [--save|--load]
+bash serve_qwen3-30ba3b_ep.sh   <ep_size>   [--save|--load]
 ```
+
+The scripts use `--cuda-graph-max-bs` (deprecated alias of
+`--cuda-graph-max-bs-decode` on `foundry-0.5.18`) so the same scripts run on both
+supported sglang branches.
 
 A single SAVE pass is enough — SGLang has no startup profile-forward, so there is no
 non-determinism that requires a two-pass save (unlike the vLLM recipe).
@@ -39,7 +51,7 @@ model or topology before SAVE.
 |---|---|---|---|
 | Single GPU | `serve_qwen3-mini.sh` | Qwen3-1.7B | FlashInfer backend |
 | Data parallel | `serve_qwen3-1.7b_dp.sh` | Qwen3-1.7B | one full replica/rank; `NCCL_CUMEM_ENABLE=0`/`NCCL_NVLS_ENABLE=0` |
-| Expert parallel | `serve_qwen3-30ba3bfp8_ep.sh` | Qwen3-30B-A3B-FP8 | DP-attention + DeepEP; fa3 backend |
+| Expert parallel | `serve_qwen3-30ba3b_ep.sh` | Qwen3-30B-A3B | DP-attention + DeepEP; fa3 backend; `SGL_MODEL=Qwen/Qwen3-30B-A3B-FP8` for FP8 |
 
 ## Installation
 
@@ -58,16 +70,27 @@ themselves. The standard workspace layout has `foundry/` (this repo) and `sglang
 └── sglang/                 # foundry-org/sglang fork (with direct edits applied)
 ```
 
-Use a dedicated env, kept separate from the vLLM env so kernel pins don't clash:
+Use a dedicated env, kept separate from the vLLM env so kernel pins don't clash
+(`foundry-0.5.18` pins torch 2.13; a torch-2.11 env cannot run it — sglang-kernel
+0.4.6+ is built against the torch 2.13 C++ ABI):
 
 ```bash
-conda create -p venv/ python=3.12
-conda activate venv/
-conda install -c conda-forge boost-cpp boost          # foundry C++ deps
+python3.12 -m venv venv && source venv/bin/activate
+pip install "torch==2.13.0" --index-url https://download.pytorch.org/whl/cu130
 
-# in-tree sglang fork, editable
-pip install -e sglang/python --extra-index-url https://download.pytorch.org/whl/cu130
-# foundry
+# in-tree sglang fork (branch foundry-0.5.18), editable — this pulls the FULL
+# kernel stack as wheels: flashinfer 0.6.18, sglang-kernel 0.4.6.post1,
+# sgl-deep-ep, sgl-deep-gemm, flash-attn-4. No hand-built kernels remain
+# (fa3 now lives inside sglang-kernel as sgl_kernel.flash_attn).
+pip install -e sglang/python
+
+# flashinfer's cubin/jit-cache wheels lag on PyPI — take them from flashinfer's
+# own index, versions matching flashinfer-python exactly:
+pip install "flashinfer-cubin==0.6.18" --index-url https://flashinfer.ai/whl
+pip install "flashinfer-jit-cache==0.6.18" --index-url https://flashinfer.ai/whl/cu130
+
+# foundry build deps (boost from conda/system; cmake+ninja can come from pip)
+pip install "cmake>=4.0" ninja wheel pytest
 pushd foundry && pip install -e . --no-build-isolation && popd
 ```
 
@@ -94,34 +117,30 @@ CUDA_VISIBLE_DEVICES=0,1 bash serve_qwen3-1.7b_dp.sh 2 --load
 
 ## Run (expert parallel / DeepEP)
 
-EP needs three kernel packages — all SGLang-native, no vLLM involved:
+On `foundry-0.5.18` the EP kernel stack is entirely wheel-provided by the sglang
+install above (`sgl-deep-ep`, `sgl-deep-gemm`; fa3 inside `sglang-kernel`) — there is
+nothing to build. Two things still matter:
 
 - **NVSHMEM** — already in the env. cu13 `torch` pulls the `nvidia-nvshmem-cuXX`
   wheel as a dependency (`libnvshmem_host.so.3` under `site-packages/nvidia/nvshmem/lib/`).
   Foundry auto-detects it from the wheel (just like `libcuda_hook.so`) and the
   spawn-site patches preload it into each worker — no manual path, no TOML field.
-- **DeepEP** @ `9af0e0d` — SGLang's pin. Build via SGLang's own installer
-  `sglang/scripts/ci/cuda/ci_install_deepep.sh` (it `git checkout`s exactly `9af0e0d`
-  and builds against the NVSHMEM wheel above). For a single node you can skip the
-  script's gdrcopy/RDMA apt steps and just build the wheel:
+- **NVSHMEM host/device versions must match.** The `sgl-deep-ep` wheel statically
+  embeds its NVSHMEM *device* library; the preloaded *host* library must be the same
+  version. The auto-detected `nvidia-nvshmem` wheel satisfies this. Overriding
+  `nvshmem_host_path` in the TOMLs with a lib from another NVSHMEM build (e.g. an
+  old vLLM ep_kernels workspace) aborts every rank at DeepEP init with
+  `NVSHMEM device library version does not match with NVSHMEM host library version`.
 
-  ```bash
-  git clone https://github.com/deepseek-ai/DeepEP.git && cd DeepEP
-  git checkout 9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee
-  TORCH_CUDA_ARCH_LIST="9.0" python setup.py install   # Hopper; "9.0;10.0" for Blackwell
-  cd ..
-  ```
-
-- **`sgl-deep-gemm >= 0.1.2`** (0.1.0 lacks `m_grouped_bf16_gemm_nt_masked`) and
-  **`flash-attn-3`** (the fa3 attention backend — flashinfer's ragged-prefill path
-  has an off-by-one under this config).
+(Older `foundry` branch only: DeepEP @ `9af0e0d`, `sgl-deep-gemm >= 0.1.2` and
+`flash-attn-3` were hand-built — see that branch's README.)
 
 ```bash
 rm -rf foundry_archive
-CUDA_VISIBLE_DEVICES=0,1 bash serve_qwen3-30ba3bfp8_ep.sh 2 --save
-CUDA_VISIBLE_DEVICES=0,1 bash serve_qwen3-30ba3bfp8_ep.sh 2 --load
+CUDA_VISIBLE_DEVICES=0,1 bash serve_qwen3-30ba3b_ep.sh 2 --save
+CUDA_VISIBLE_DEVICES=0,1 bash serve_qwen3-30ba3b_ep.sh 2 --load
 curl -s http://0.0.0.0:12000/v1/completions -H 'Content-Type: application/json' \
-  -d '{"model":"Qwen/Qwen3-30B-A3B-FP8","prompt":"The capital of France is","max_tokens":12,"temperature":0}'
+  -d '{"model":"Qwen/Qwen3-30B-A3B","prompt":"The capital of France is","max_tokens":12,"temperature":0}'
 ```
 
 The EP script sets `--enable-dp-attention --moe-a2a-backend deepep --deepep-mode
@@ -151,4 +170,5 @@ For DP / EP each rank gets its own `rank_<N>/`.
 |---|---|
 | `Reserved address … != requested base 0x600000000000` | VMM base collided with another allocation. Re-run; non-deterministic, the next run usually succeeds. |
 | EP replay `illegal memory access` / `nvshmemx_cumodule_init not found` | `libnvshmem_host.so.3` not preloaded — foundry couldn't auto-detect the `nvidia-nvshmem` wheel. Confirm it's installed (`pip show nvidia-nvshmem-cu13`), or set `nvshmem_host_path` in both TOMLs. |
+| `NVSHMEM device library version does not match with NVSHMEM host library version`, then segfault | A custom `nvshmem_host_path` in the TOMLs points at a different NVSHMEM build than the one inside the `sgl-deep-ep` wheel. Remove the override; foundry's auto-detected `nvidia-nvshmem` wheel matches. |
 | `nvshmem_qp_depth >= (num_max_dispatch_tokens_per_rank + 1) * 2` | `SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK` too high for `NVSHMEM_QP_DEPTH`; lower it or raise the QP depth. |

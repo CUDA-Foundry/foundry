@@ -1,16 +1,18 @@
 #!/bin/bash
-# Qwen3-30B-A3B-FP8 (MoE), expert parallel via DeepEP low-latency + DP-attention.
-# Usage: CUDA_VISIBLE_DEVICES=0,1 bash serve_qwen3-30ba3bfp8_ep.sh <ep_size> [--save|--load]
+# Qwen3-30B-A3B (MoE), expert parallel via DeepEP low-latency + DP-attention.
+# Usage: CUDA_VISIBLE_DEVICES=0,1 bash serve_qwen3-30ba3b_ep.sh <ep_size> [--save|--load]
 #
-# Requires (see README §EP): deep_ep @ 9af0e0d, sgl-deep-gemm >= 0.1.2, flash-attn-3,
-# and the nvshmem_host_path uncommented in foundry_{save,load}.toml.
+# On the foundry-0.5.18 sglang branch the EP kernel stack (sgl-deep-ep,
+# sgl-deep-gemm, fa3 inside sglang-kernel) is wheel-provided by the sglang
+# install; NVSHMEM auto-detects from the nvidia-nvshmem wheel (leave
+# nvshmem_host_path unset in the TOMLs — see README §EP).
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 EP_SIZE=${1:?Usage: $0 <ep_size> [--save|--load]}
-# FP8 routes through the Fp8Config MoE path (deep_gemm fp8 kernels), avoiding the
-# bf16 masked-GEMM the pinned deep_gemm may lack. Override MODEL_NAME for bf16.
-MODEL_NAME="${SGL_MODEL:-Qwen/Qwen3-30B-A3B-FP8}"
+# bf16 is the validated default on foundry-0.5.18 (sgl-deep-gemm's masked bf16
+# GEMM is present in the wheel); override for FP8: SGL_MODEL=Qwen/Qwen3-30B-A3B-FP8.
+MODEL_NAME="${SGL_MODEL:-Qwen/Qwen3-30B-A3B}"
 HOST="0.0.0.0"
 PORT=12000
 MEM_FRACTION_STATIC=0.8
