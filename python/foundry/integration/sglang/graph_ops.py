@@ -33,6 +33,16 @@ _GRAPH_FILENAME_RE = re.compile(r"^graph_(?P<index>\d+)_FULL_t(?P<bs>\d+)_r\d+_U
 def _batch_size_from_key(key: Any) -> int:
     if isinstance(key, int):
         return key
+    # ShapeKey(size, stream_idx, variant_label, dsa_variant): phase 1 persists
+    # only plain single-stream decode graphs, where size == bs.
+    if hasattr(key, "size"):
+        if (
+            key.stream_idx is not None
+            or key.variant_label is not None
+            or key.dsa_variant is not None
+        ):
+            raise ValueError(f"Foundry SGLang save/load does not support graph variants: {key!r}")
+        return key.size
     key_str = str(key)
     for part in reversed(key_str.split("_")):
         if part.isdigit():
@@ -211,7 +221,9 @@ def bootstrap_deepep_buffer(cuda_graph_runner) -> bool:
         DeepEPDispatcher,
     )
 
-    if DeepEPBuffer._buffer is not None:
+    # The singleton now lives on the runtime context's resources
+    # (DeepEPBuffer._state().buffer), not a class attribute.
+    if DeepEPBuffer._state().buffer is not None:
         return True
 
     model = cuda_graph_runner.model_runner.model
@@ -250,48 +262,26 @@ def bootstrap_deepep_buffer(cuda_graph_runner) -> bool:
 
 
 def initialize_attention_metadata_for_bs(cuda_graph_runner, bs: int) -> None:
-    """Populate ``decode_cuda_graph_metadata[bs]`` for runtime replay.
+    """Populate the backend's per-bs cuda-graph metadata for runtime replay.
 
-    The FlashInfer wrappers and their internal ``_int_workspace_buffer``
-    are constructed here, outside the captured graph. The graph's
-    runtime kernels reference these buffer addresses, so LOAD must
-    re-run the same call before runtime replay so the wrappers exist
-    at deterministic VMM addresses.
+    Drives the public capture-time entry point with a duck-typed batch
+    carrying exactly the fields ``init_forward_metadata_out_graph`` reads.
+    With ``in_capture=True`` FlashInfer's implementation first runs its
+    allocation half (``_prepare_cuda_graph_metadata``: wrappers +
+    ``_int_workspace_buffer``) and then the planner — the graph's runtime
+    kernels reference these buffer addresses, so LOAD must re-run the same
+    call before replay so the wrappers exist at deterministic VMM
+    addresses. fa3-style backends allocate their metadata once in
+    ``init_cuda_graph_state``; for them this only builds lightweight views
+    and does not move the VMM cursor.
     """
     buffers = cuda_graph_runner.buffers
     attn_backend = cuda_graph_runner.attn_backend
-    num_tokens = bs * cuda_graph_runner.num_tokens_per_bs
+    num_tokens = bs * cuda_graph_runner.captured_req_width
     encoder_lens = buffers.encoder_lens[:bs] if cuda_graph_runner.is_encoder_decoder else None
     spec_info = cuda_graph_runner.get_spec_info(num_tokens)
     forward_mode = cuda_graph_runner.capture_forward_mode
 
-    if hasattr(attn_backend, "_prepare_cuda_graph_metadata"):
-        # FlashInfer. Allocation half (wrappers + _int_workspace_buffer),
-        # then the planner half mirroring init_forward_metadata_out_graph's
-        # decode branch. The old fused init ran both; keeping the planner in
-        # the pre-pass keeps any plan-time allocations at the same VMM
-        # cursor position on SAVE and LOAD.
-        attn_backend._prepare_cuda_graph_metadata(bs, num_tokens, forward_mode, spec_info)
-        if forward_mode.is_decode_or_idle():
-            seq_lens = buffers.seq_lens[:bs]
-            attn_backend.indices_updater_decode.update(
-                buffers.req_pool_indices[:bs],
-                seq_lens,
-                buffers.seq_lens_cpu[:bs],
-                seq_lens.sum().item(),
-                decode_wrappers=attn_backend.decode_cuda_graph_metadata[bs],
-                encoder_lens=encoder_lens,
-                spec_info=spec_info,
-                fixed_split_size=None,
-                disable_split_kv=attn_backend.disable_cuda_graph_kv_split,
-            )
-        return
-
-    # Other backends (fa3 etc.): drive the public capture-time entry point
-    # with a duck-typed batch carrying exactly the fields
-    # init_forward_metadata_out_graph reads. These backends' per-bs metadata
-    # are views over the fixed init_cuda_graph_state workspace (not graph
-    # memory), so this runs after load without moving the VMM cursor.
     fb = SimpleNamespace(
         forward_mode=forward_mode,
         batch_size=bs,
