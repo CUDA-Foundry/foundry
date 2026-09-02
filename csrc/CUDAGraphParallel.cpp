@@ -151,8 +151,7 @@ ParsedGraphData CUDAGraph::prepare_graph_shell(boost::json::value&& root_val, Me
       uint64_t wholegraph_increment = gen_obj.at("wholegraph_increment").to_number<uint64_t>();
 
       auto state = registry.get_state_from_id(state_id, seed);
-      state->register_graph(reinterpret_cast<at::cuda::CUDAGraph*>(graph.get()));
-      graph->captured_generator_states_[state] = wholegraph_increment;
+      graph->register_generator_state(state, wholegraph_increment);
     }
   }
 
