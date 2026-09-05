@@ -167,8 +167,12 @@ class graph:
         self.stream_ctx.__exit__(*args)
 
 
-def save_graph_manifest(archive_dir: str) -> None:
+def save_graph_manifest(archive_dir: str, enable_templates: bool = True) -> None:
     """Write graph_manifest.json with topology groups and template assignments.
+
+    With ``enable_templates=False`` every graph is its own topology group
+    (template of itself, no on-demand members), so LOAD rebuilds each graph
+    from its full node list instead of re-parameterizing a shared template.
 
     Reads topology_key from each saved graph JSON, groups graphs by topology,
     picks the first graph in each group as the template, strips the
@@ -193,6 +197,8 @@ def save_graph_manifest(archive_dir: str) -> None:
         topo_key = data.get("topology_key", "")
         if not topo_key:
             return
+        if not enable_templates:
+            topo_key = f"{topo_key}#{filename}"
         topology_keys.setdefault(topo_key, []).append(filename)
 
     # Build manifest
@@ -235,7 +241,8 @@ def save_graph_manifest(archive_dir: str) -> None:
     import sys
 
     print(
-        f"[foundry] Saved graph_manifest.json: {num_templates} topology groups "
+        f"[foundry] Saved graph_manifest.json (templates={'on' if enable_templates else 'off'}): "
+        f"{num_templates} topology groups "
         f"({num_templates} templates, {num_on_demand} on-demand, "
         f"{num_stripped} stripped)",
         file=sys.stderr,

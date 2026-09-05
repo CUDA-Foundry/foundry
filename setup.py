@@ -89,6 +89,7 @@ class CustomBuildExt(BuildExtension):
                 str(cmake_build_dir),
                 f"-DCMAKE_INSTALL_PREFIX={build_dir}",
             ]
+            + (["-DCMAKE_CXX_FLAGS=-DFOUNDRY_DEBUG"] if os.getenv("FOUNDRY_DEBUG") else [])
         )
 
         # Build and install

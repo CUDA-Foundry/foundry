@@ -1,16 +1,29 @@
 #!/bin/bash
-# Qwen3-30B-A3B-FP8 (MoE), expert parallel via DeepEP low-latency + DP-attention.
-# Usage: CUDA_VISIBLE_DEVICES=0,1 bash serve_qwen3-30ba3bfp8_ep.sh <ep_size> [--save|--load]
+# Qwen3-30B-A3B (MoE), expert parallel via DeepEP low-latency with TP ATTENTION:
+# the attention allreduce runs through torch symmetric memory instead of using
+# DP-attention. This mirrors the vLLM EP topology (recipe/vllm/*_ep.sh).
+# Usage: CUDA_VISIBLE_DEVICES=0,1 bash serve_qwen3-30ba3b_ep_tpattn.sh <ep_size> [--save|--load]
+# SGL_EXTRA_ARGS: extra `sglang serve` flags appended verbatim (e.g. \"--cuda-graph-backend-prefill disabled\").
 #
-# Requires (see README §EP): deep_ep @ 9af0e0d, sgl-deep-gemm >= 0.1.2, flash-attn-3,
-# and the nvshmem_host_path uncommented in foundry_{save,load}.toml.
+# vs serve_qwen3-30ba3b_ep.sh: --dp-size/--enable-dp-attention are replaced by
+# --disable-custom-all-reduce --enable-torch-symm-mem (decode-graph allreduce =
+# symm_mem two_shot on the persistent symmetric buffer foundry places
+# deterministically) and --cuda-graph-backend-prefill disabled — without
+# DP-attention every rank dispatches the full prefill chunk, and prefill-graph
+# capture trips DeepEP's num_max_dispatch_tokens_per_rank assert even on
+# baseline sglang. Requires the fork's two-shot-without-multicast fix
+# (`foundry` branch) on hosts without IMEX channels.
+#
+# The EP kernel stack (sgl-deep-ep, sgl-deep-gemm, fa3 inside sglang-kernel) is
+# wheel-provided by the sglang install; NVSHMEM auto-detects from the
+# nvidia-nvshmem wheel (leave nvshmem_host_path unset in the TOMLs — README §EP).
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 EP_SIZE=${1:?Usage: $0 <ep_size> [--save|--load]}
-# FP8 routes through the Fp8Config MoE path (deep_gemm fp8 kernels), avoiding the
-# bf16 masked-GEMM the pinned deep_gemm may lack. Override MODEL_NAME for bf16.
-MODEL_NAME="${SGL_MODEL:-Qwen/Qwen3-30B-A3B-FP8}"
+# bf16 is the validated default on the `foundry` branch (sgl-deep-gemm's masked bf16
+# GEMM is present in the wheel); override for FP8: SGL_MODEL=Qwen/Qwen3-30B-A3B-FP8.
+MODEL_NAME="${SGL_MODEL:-Qwen/Qwen3-30B-A3B}"
 HOST="0.0.0.0"
 PORT=12000
 MEM_FRACTION_STATIC=0.8
@@ -55,9 +68,9 @@ sglang serve \
     --trust-remote-code \
     --host "$HOST" --port "$PORT" \
     --tp-size "$EP_SIZE" \
-    --dp-size "$EP_SIZE" \
     --ep-size "$EP_SIZE" \
-    --enable-dp-attention \
+    --enable-torch-symm-mem \
+    --cuda-graph-backend-prefill disabled \
     --moe-a2a-backend deepep \
     --deepep-mode low_latency \
     --moe-runner-backend deep_gemm \
@@ -67,4 +80,5 @@ sglang serve \
     --chunked-prefill-size 256 \
     --attention-backend fa3 \
     --cuda-graph-max-bs 128 \
-    "${FOUNDRY_ARGS[@]}"
+    "${FOUNDRY_ARGS[@]}" \
+    ${SGL_EXTRA_ARGS:-}

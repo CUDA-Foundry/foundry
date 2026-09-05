@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import time
+from types import SimpleNamespace
 from typing import Any
 
 import torch
@@ -32,6 +33,16 @@ _GRAPH_FILENAME_RE = re.compile(r"^graph_(?P<index>\d+)_FULL_t(?P<bs>\d+)_r\d+_U
 def _batch_size_from_key(key: Any) -> int:
     if isinstance(key, int):
         return key
+    # ShapeKey(size, stream_idx, variant_label, dsa_variant): phase 1 persists
+    # only plain single-stream decode graphs, where size == bs.
+    if hasattr(key, "size"):
+        if (
+            key.stream_idx is not None
+            or key.variant_label is not None
+            or key.dsa_variant is not None
+        ):
+            raise ValueError(f"Foundry SGLang save/load does not support graph variants: {key!r}")
+        return key.size
     key_str = str(key)
     for part in reversed(key_str.split("_")):
         if part.isdigit():
@@ -117,7 +128,7 @@ def save_graph_manifest() -> None:
     cfg = get_config()
     if cfg is None or cfg.workspace_dir is None:
         return
-    foundry_pkg.save_graph_manifest(cfg.workspace_dir)
+    foundry_pkg.save_graph_manifest(cfg.workspace_dir, enable_templates=cfg.graph_templates)
 
 
 def pack_fatbins() -> None:
@@ -200,9 +211,14 @@ def bootstrap_deepep_buffer(cuda_graph_runner) -> bool:
     try:
         from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 
-        if not get_moe_a2a_backend().is_deepep():
-            return False
+        backend = get_moe_a2a_backend()
     except Exception:
+        return False
+    # Outside the guard: a failure to build the buffer must surface here, not
+    # resurface as a native abort when the capture forward retries lazily.
+    if backend.is_deepep_v2():
+        return _bootstrap_deepep_v2_buffer(cuda_graph_runner)
+    if not backend.is_deepep():
         return False
 
     from sglang.srt.layers.moe.token_dispatcher.deepep import (
@@ -210,7 +226,9 @@ def bootstrap_deepep_buffer(cuda_graph_runner) -> bool:
         DeepEPDispatcher,
     )
 
-    if DeepEPBuffer._buffer is not None:
+    # The singleton now lives on the runtime context's resources
+    # (DeepEPBuffer._state().buffer), not a class attribute.
+    if DeepEPBuffer._state().buffer is not None:
         return True
 
     model = cuda_graph_runner.model_runner.model
@@ -248,28 +266,93 @@ def bootstrap_deepep_buffer(cuda_graph_runner) -> bool:
     return False
 
 
-def initialize_attention_metadata_for_bs(cuda_graph_runner, bs: int) -> None:
-    """Populate ``decode_cuda_graph_metadata[bs]`` for runtime replay.
+def _bootstrap_deepep_v2_buffer(cuda_graph_runner) -> bool:
+    """DeepEP v2 counterpart: create the process-wide ``ElasticBuffer`` (its own
+    NCCL communicator + symmetric-memory windows) before capture / graph load.
 
-    The FlashInfer wrappers and their internal ``_int_workspace_buffer``
-    are constructed here, outside the captured graph. The graph's
-    runtime kernels reference these buffer addresses, so LOAD must
-    re-run the same call before runtime replay so the wrappers exist
-    at deterministic VMM addresses.
+    sglang creates it lazily on the first dispatch, which on SAVE is inside the
+    first captured forward and on LOAD would be the first request — so the
+    window VA and NCCL state would sit at different allocation-sequence points
+    on the two paths. Collective over the EP group, like the v1 bootstrap.
+    """
+    from sglang.srt.layers.moe.token_dispatcher.deepep_v2 import (
+        DeepEPv2Buffer,
+        DeepEPv2Dispatcher,
+    )
+
+    if DeepEPv2Buffer._state().buffer is not None:
+        return True
+
+    model = cuda_graph_runner.model_runner.model
+    for module in model.modules():
+        dispatcher = getattr(module, "dispatcher", None)
+        if dispatcher is None:
+            continue
+        candidates = [dispatcher, *getattr(dispatcher, "_inners", [])]
+        v2 = next((d for d in candidates if isinstance(d, DeepEPv2Dispatcher)), None)
+        if v2 is None:
+            continue
+        t0 = time.perf_counter()
+        # Prototype bisect knob: build the buffer (NCCL comm, GIN/GDAKI context,
+        # symmetric windows) with the hook's region suspended, so its
+        # allocations go to plain CUDA memory. Non-deterministic across
+        # SAVE/LOAD; only for isolating hook-vs-NCCL failures.
+        outside_region = os.environ.get("FOUNDRY_V2_BUFFER_OUTSIDE_REGION") == "1"
+        if outside_region:
+            cge.stop_allocation_region()
+        try:
+            v2._impl._get_buffer()
+        finally:
+            if outside_region:
+                cge.resume_allocation_region()
+        logger.info(
+            "[Foundry] Bootstrapped DeepEP v2 ElasticBuffer pre-capture in %.3fs%s",
+            time.perf_counter() - t0,
+            " (outside region)" if outside_region else "",
+        )
+        return True
+
+    logger.warning(
+        "[Foundry] DeepEP v2 backend active but no DeepEPv2Dispatcher found on the "
+        "model; ElasticBuffer not bootstrapped."
+    )
+    return False
+
+
+def initialize_attention_metadata_for_bs(cuda_graph_runner, bs: int) -> None:
+    """Populate the backend's per-bs cuda-graph metadata for runtime replay.
+
+    Drives the public capture-time entry point with a duck-typed batch
+    carrying exactly the fields ``init_forward_metadata_out_graph`` reads.
+    With ``in_capture=True`` FlashInfer's implementation first runs its
+    allocation half (``_prepare_cuda_graph_metadata``: wrappers +
+    ``_int_workspace_buffer``) and then the planner — the graph's runtime
+    kernels reference these buffer addresses, so LOAD must re-run the same
+    call before replay so the wrappers exist at deterministic VMM
+    addresses. fa3-style backends allocate their metadata once in
+    ``init_cuda_graph_state``; for them this only builds lightweight views
+    and does not move the VMM cursor.
     """
     buffers = cuda_graph_runner.buffers
-    num_tokens = bs * cuda_graph_runner.num_tokens_per_bs
+    attn_backend = cuda_graph_runner.attn_backend
+    num_tokens = bs * cuda_graph_runner.captured_req_width
     encoder_lens = buffers.encoder_lens[:bs] if cuda_graph_runner.is_encoder_decoder else None
     spec_info = cuda_graph_runner.get_spec_info(num_tokens)
-    cuda_graph_runner.attn_backend.init_forward_metadata_capture_cuda_graph(
-        bs,
-        num_tokens,
-        buffers.req_pool_indices[:bs],
-        buffers.seq_lens[:bs],
-        encoder_lens,
-        cuda_graph_runner.capture_forward_mode,
-        spec_info,
+    forward_mode = cuda_graph_runner.capture_forward_mode
+
+    fb = SimpleNamespace(
+        forward_mode=forward_mode,
+        batch_size=bs,
+        req_pool_indices=buffers.req_pool_indices[:bs],
+        seq_lens=buffers.seq_lens[:bs],
+        seq_lens_cpu=buffers.seq_lens_cpu[:bs],
+        seq_lens_sum=int(buffers.seq_lens[:bs].sum().item()),
+        encoder_lens=encoder_lens,
+        spec_info=spec_info,
+        out_cache_loc=buffers.out_cache_loc[:num_tokens],
+        positions=buffers.positions[:num_tokens],
     )
+    attn_backend.init_forward_metadata_out_graph(fb, in_capture=True)
 
 
 def initialize_all_attention_metadata(cuda_graph_runner) -> None:

@@ -81,17 +81,36 @@ Foundry ships engine integrations under `foundry/python/foundry/integration/`. P
 
 | Engine | Single GPU | DP | TP | EP |
 |---|:---:|:---:|:---:|:---:|
-| SGLang | ✅ | ✅ | 🚧 | ✅ |
+| SGLang | ✅ | ✅ | ✅ | ✅ |
 | vLLM | ✅ | ✅ | 🚧 | ✅ |
 | TensorRT-LLM | 🚧 | 🚧 | 🚧 | 🚧 |
 
 ✅ validated end-to-end (SAVE → LOAD → query) &nbsp;·&nbsp; 🚧 not yet
 
+SGLang TP uses torch symmetric-memory allreduce inside the decode graphs (TP=2/4);
+SGLang EP covers DeepEP low-latency (NVSHMEM) and DeepEP v2 (NCCL symmetric
+windows). Every SGLang configuration is validated with the full decode-graph set
+(batch sizes 1..256) for restore time, per-token latency and greedy-output
+equality against unmodified SGLang; see [`recipe/sglang/README.md`](recipe/sglang/README.md#validation).
+
 The adapted vLLM / SGLang / TensorRT-LLM forks will be released alongside this repo at `foundry-org/vllm`, `foundry-org/sglang`, `foundry-org/TensorRT-LLM`.
 
 ### Performance
 
-🚧🚧🚧
+SGLang on 8×H100 (2 GPUs per run), all 256 decode graphs captured or restored,
+prefill graphs off on both sides, median TPOT of restored vs unmodified SGLang:
+
+| Config | Model | Capture | Restore | Init to `/health`: SGLang → foundry LOAD | TPOT delta (bs 1 / 8 / 32 / 128) |
+|---|---|---:|---:|---:|---|
+| TP=2 (symm-mem) | Qwen3-32B | 26.7 s | 3.5 s | 63 s → 41 s | -0.4 / -0.3 / +0.0 / -0.7 % |
+| EP=2 (DeepEP LL) | Qwen3-30B-A3B | 38.0 s | 2.5 s | 75 s → 45 s | -0.0 / -0.0 / +0.1 / +0.6 % |
+| EP=2 (DeepEP v2, NCCL) | Qwen3-30B-A3B-FP8 | 56 s | 2.1 s | 93 s → 45 s | +0.0 / +0.0 / +0.2 / +0.2 % |
+
+Restored graphs keep their programmatic-dependent-launch edges, so per-token
+latency matches the captured graphs within run-to-run noise
+([`docs/pdl-edge-batching.md`](docs/pdl-edge-batching.md)). Greedy completions
+are identical to unmodified SGLang for dense TP and within SGLang's own
+run-to-run nondeterminism for MoE.
 
 ## Roadmap
 
@@ -122,6 +141,16 @@ pip install torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0 --index-url htt
 pip install -e . --no-build-isolation
 ```
 
+### Debugging
+
+Verbose C++ logging (allocator hook and graph replay) is gated behind a
+single compile-time flag, `FOUNDRY_DEBUG`. Uncomment the
+`// #define FOUNDRY_DEBUG` line at the top of `csrc/hook.cpp` or
+`csrc/CUDAGraph.cpp` (or build with `-DFOUNDRY_DEBUG`) and reinstall.
+With the flag on, every LOAD also logs a per-graph check that the restored
+edge records (PDL programmatic edges) survived insertion; see
+[`docs/pdl-edge-batching.md`](docs/pdl-edge-batching.md).
+
 ## Quick Start
 
 ### Graph Capture and Save
@@ -137,7 +166,7 @@ device = torch.device('cuda:0')
 torch.set_default_device(device)
 
 # Set up VMM allocation region for deterministic memory addresses
-BASE_ADDR = 0x7f0000000000
+BASE_ADDR = 0x400000000000
 region_size = fdry.parse_size('1GB')
 fdry.set_allocation_region(BASE_ADDR, region_size)
 
@@ -182,7 +211,7 @@ torch.set_default_device(device)
 fdry.load_cuda_modules_and_libraries('hook_archive')
 
 # Set up the same allocation region as capture
-BASE_ADDR = 0x7f0000000000
+BASE_ADDR = 0x400000000000
 region_size = fdry.parse_size('1GB')
 fdry.set_allocation_region(BASE_ADDR, region_size)
 

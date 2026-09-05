@@ -32,6 +32,7 @@
 #include <chrono>
 #include "hook.h"
 #include "BinaryGraphFormat.h"
+#include "GraphDependencies.h"
 
 namespace {
 
@@ -151,8 +152,7 @@ ParsedGraphData CUDAGraph::prepare_graph_shell(boost::json::value&& root_val, Me
       uint64_t wholegraph_increment = gen_obj.at("wholegraph_increment").to_number<uint64_t>();
 
       auto state = registry.get_state_from_id(state_id, seed);
-      state->register_graph(reinterpret_cast<at::cuda::CUDAGraph*>(graph.get()));
-      graph->captured_generator_states_[state] = wholegraph_increment;
+      graph->register_generator_state(state, wholegraph_increment);
     }
   }
 
@@ -205,6 +205,8 @@ GraphLoadResult CUDAGraph::build_graph_from_parsed(ParsedGraphData&& parsed, CUc
                common_preferred_cluster_z = 0;
   bool has_common_preferred_shared_mem_carveout = false;
   unsigned int common_preferred_shared_mem_carveout = 0;
+  bool has_common_programmatic_stream_serialization = false;
+  int common_programmatic_stream_serialization = 0;
   bool has_common_attrs = false;
 
   if (root.contains("common_kernel_node_attrs")) {
@@ -249,6 +251,11 @@ GraphLoadResult CUDAGraph::build_graph_from_parsed(ParsedGraphData&& parsed, CUc
       has_common_preferred_shared_mem_carveout = true;
       common_preferred_shared_mem_carveout =
           common.at("preferredSharedMemCarveout").to_number<unsigned int>();
+    }
+    if (common.contains("programmaticStreamSerialization")) {
+      has_common_programmatic_stream_serialization = true;
+      common_programmatic_stream_serialization =
+          common.at("programmaticStreamSerialization").to_number<int>();
     }
   }
 
@@ -319,6 +326,8 @@ GraphLoadResult CUDAGraph::build_graph_from_parsed(ParsedGraphData&& parsed, CUc
       int access_policy_hit_prop = 0, access_policy_miss_prop = 0;
       bool has_device_updatable = false;
       int device_updatable = 0;
+      bool has_programmatic_stream_serialization = false;
+      int programmatic_stream_serialization = 0;
 
       if (params.contains("kernel_node_attrs")) {
         const json::object& node_attrs = params.at("kernel_node_attrs").as_object();
@@ -373,6 +382,11 @@ GraphLoadResult CUDAGraph::build_graph_from_parsed(ParsedGraphData&& parsed, CUc
           has_device_updatable = true;
           device_updatable = node_attrs.at("deviceUpdatable").to_number<int>();
         }
+        if (node_attrs.contains("programmaticStreamSerialization")) {
+          has_programmatic_stream_serialization = true;
+          programmatic_stream_serialization =
+              node_attrs.at("programmaticStreamSerialization").to_number<int>();
+        }
       }
 
       // Set function attributes
@@ -403,6 +417,14 @@ GraphLoadResult CUDAGraph::build_graph_from_parsed(ParsedGraphData&& parsed, CUc
             C10_CUDA_DRIVER_CHECK(
                 cuKernelSetAttribute(CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, max_shared,
                                      kern, graph->capture_dev_));
+            // cuGraphAddKernelNode validates dynamic smem against the
+            // per-context CUfunction, which does not inherit the CUkernel
+            // attribute (>48KB kernels fail with CUDA_ERROR_INVALID_VALUE).
+            CUfunction ctx_func = nullptr;
+            if (cuKernelGetFunction(&ctx_func, kern) == CUDA_SUCCESS && ctx_func) {
+              C10_CUDA_DRIVER_CHECK(cuFuncSetAttribute(
+                  ctx_func, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, max_shared));
+            }
           }
           if (preferred_carveout >= 0) {
             C10_CUDA_DRIVER_CHECK(
@@ -598,6 +620,15 @@ GraphLoadResult CUDAGraph::build_graph_from_parsed(ParsedGraphData&& parsed, CUc
         C10_CUDA_DRIVER_CHECK(cuGraphKernelNodeSetAttribute(
             cuNode, CU_KERNEL_NODE_ATTRIBUTE_DEVICE_UPDATABLE_KERNEL_NODE, &updatable_attr));
       }
+      if (has_programmatic_stream_serialization) {
+        CUkernelNodeAttrValue pss_attr;
+        memset(&pss_attr, 0, sizeof(pss_attr));
+        pss_attr.programmaticStreamSerializationAllowed = programmatic_stream_serialization;
+        C10_CUDA_DRIVER_CHECK(cuGraphKernelNodeSetAttribute(
+            cuNode,
+            static_cast<CUkernelNodeAttrID>(CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION),
+            &pss_attr));
+      }
 
     } else if (node_type == "MemcpyNode") {
       CUDA_MEMCPY3D copy_params;
@@ -769,6 +800,17 @@ GraphLoadResult CUDAGraph::build_graph_from_parsed(ParsedGraphData&& parsed, CUc
             node, CU_KERNEL_NODE_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT, &carveout_attr));
       }
     }
+    if (has_common_programmatic_stream_serialization) {
+      CUkernelNodeAttrValue pss_attr;
+      memset(&pss_attr, 0, sizeof(pss_attr));
+      pss_attr.programmaticStreamSerializationAllowed = common_programmatic_stream_serialization;
+      for (auto node : kernel_nodes_for_common_attrs) {
+        C10_CUDA_DRIVER_CHECK(cuGraphKernelNodeSetAttribute(
+            node,
+            static_cast<CUkernelNodeAttrID>(CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION),
+            &pss_attr));
+      }
+    }
   }
 
   // Add dependencies
@@ -779,19 +821,28 @@ GraphLoadResult CUDAGraph::build_graph_from_parsed(ParsedGraphData&& parsed, CUc
     from_nodes.reserve(deps_array.size());
     to_nodes.reserve(deps_array.size());
 
+    std::vector<CUgraphEdgeData> edge_data(deps_array.size());
+    memset(edge_data.data(), 0, edge_data.size() * sizeof(CUgraphEdgeData));
+    size_t di = 0;
     for (const auto& dep_val : deps_array) {
       const json::object& dep_obj = dep_val.as_object();
       from_nodes.push_back(id_to_node[dep_obj.at("from").to_number<int>()]);
       to_nodes.push_back(id_to_node[dep_obj.at("to").to_number<int>()]);
+      // Restore edge data (PDL programmatic ports); absent fields = default.
+      if (auto* v = dep_obj.if_contains("from_port")) {
+        edge_data[di].from_port = (unsigned char)v->to_number<int>();
+      }
+      if (auto* v = dep_obj.if_contains("to_port")) {
+        edge_data[di].to_port = (unsigned char)v->to_number<int>();
+      }
+      if (auto* v = dep_obj.if_contains("edge_type")) {
+        edge_data[di].type = (unsigned char)v->to_number<int>();
+      }
+      di++;
     }
 
-#if (defined(CUDA_VERSION) && CUDA_VERSION >= 13000)
-    CUresult dep_result = cuGraphAddDependencies(cuGraph, from_nodes.data(), to_nodes.data(),
-                                                 nullptr, deps_array.size());
-#else
-    CUresult dep_result = cuGraphAddDependencies_v2(cuGraph, from_nodes.data(), to_nodes.data(),
-                                                    nullptr, deps_array.size());
-#endif
+    CUresult dep_result = add_graph_dependencies(cuGraph, from_nodes.data(), to_nodes.data(),
+                                                 edge_data.data(), deps_array.size());
     if (dep_result != CUDA_SUCCESS) {
       fprintf(stderr, "[foundry LOAD ERROR] cuGraphAddDependencies FAILED with error %d\n",
               dep_result);
@@ -974,6 +1025,11 @@ void CUDAGraph::prepare_on_demand_graph(ParsedGraphData& parsed, CUcontext ctx,
           if (max_shared > 0) {
             C10_CUDA_DRIVER_CHECK(cuKernelSetAttribute(
                 CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, max_shared, kern, dev));
+            CUfunction ctx_func = nullptr;  // see binary path: per-context function too
+            if (cuKernelGetFunction(&ctx_func, kern) == CUDA_SUCCESS && ctx_func) {
+              C10_CUDA_DRIVER_CHECK(cuFuncSetAttribute(
+                  ctx_func, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, max_shared));
+            }
           }
           if (preferred_carveout >= 0) {
             C10_CUDA_DRIVER_CHECK(cuKernelSetAttribute(
@@ -1322,6 +1378,15 @@ void CUDAGraph::prepare_on_demand_graph_binary(const BinaryGraphFile& bin_file,
             C10_CUDA_DRIVER_CHECK(
                 cuKernelSetAttribute(CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
                                      k.max_dynamic_shared_size_bytes, kern, dev));
+            // cuGraphKernelNodeSetParams validates dynamic smem against the
+            // per-context CUfunction, which does not inherit the CUkernel
+            // attribute; a member kernel unseen by any template hits this.
+            CUfunction ctx_func = nullptr;
+            if (cuKernelGetFunction(&ctx_func, kern) == CUDA_SUCCESS && ctx_func) {
+              C10_CUDA_DRIVER_CHECK(
+                  cuFuncSetAttribute(ctx_func, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                                     k.max_dynamic_shared_size_bytes));
+            }
           }
           if (k.preferred_shared_memory_carveout >= 0) {
             C10_CUDA_DRIVER_CHECK(
@@ -1978,6 +2043,9 @@ std::shared_ptr<PendingGraphLoads> start_graph_builds_impl(
         CUDAGraph::prepare_on_demand_graph(tmpl_parsed, main_ctx, shared,
                                            static_cast<int>(tmpl_idx));
         result.graph->on_demand_data_->graph_name = graph_names[tmpl_idx];
+        // Bind the template to the shared exec before any member rewrites the
+        // shared graph's params.
+        result.graph->materialize_on_demand_exec();
 
         double tmpl_ms =
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_tmpl)
@@ -1995,11 +2063,19 @@ std::shared_ptr<PendingGraphLoads> start_graph_builds_impl(
       }
 
       // Phase 2c: Quick linking — associate on-demand graphs with shared execs.
+      const char* lazy_env = std::getenv("FOUNDRY_LAZY_GRAPH_EXEC");
+      const bool lazy_graph_exec = lazy_env && lazy_env[0] == '1';
       for (size_t i = 0; i < num; ++i) {
         if (template_for[i] == SIZE_MAX)
           continue;
         size_t tmpl_idx = template_for[i];
         CUDAGraph::link_on_demand_shared_exec(*all_parsed[i].graph, shared_execs.at(tmpl_idx));
+        // Default: instantiate every member's exec now (~5 ms per ~1000-node
+        // graph) so no replay ever stalls. FOUNDRY_LAZY_GRAPH_EXEC=1 defers
+        // it to each graph's first replay and shortens load instead.
+        if (!lazy_graph_exec) {
+          all_parsed[i].graph->materialize_on_demand_exec();
+        }
       }
 
       double phase2_ms =
@@ -2047,7 +2123,20 @@ GraphLoadResult finish_one_graph_load_impl(std::shared_ptr<PendingGraphLoads> pe
 
   // Register deferred generators (before allocator replay to match
   // SAVE mode timing where generators are created before graph capture).
+  //
+  // The first registration lazily creates the generator state's
+  // seed/offset_extragraph_ tensors (two at::empty in
+  // CUDAGeneratorState::register_graph). Whether that at::empty grows a
+  // fresh caching-allocator segment depends on the free-pool state, which
+  // is NOT mirrored between SAVE and LOAD (SAVE's lazy init fires inside
+  // capture_begin, before the start_base_addr snapshot). If the growth
+  // happened inside the tracked region here, the VMM cursor would move
+  // past the recorded start_base_addr and replay_hook_events_from_json
+  // below would abort ("Memory offset mismatch during replay", observed
+  // as a 2 MB drift on A100). Suspend the region so any segment growth
+  // lands outside the tracked cursor.
   if (pending->registry && !entry.generators_meta.is_null()) {
+    foundry::SuspendAllocationRegion suspend_region;
     const boost::json::array& gen_array = entry.generators_meta.as_array();
     for (const auto& gen_val : gen_array) {
       const boost::json::object& gen_obj = gen_val.as_object();

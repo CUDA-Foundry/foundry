@@ -271,13 +271,18 @@ def preallocate_for_load_mode() -> None:
 
 def _preallocate_attention_workspaces(metadata_builders: list | None) -> None:
     try:
-        from vllm.v1.attention.backends.flashinfer import (
-            FlashInferMetadataBuilder,
-            _get_trtllm_gen_workspace_buffer,
-        )
+        from vllm.v1.attention.backends import flashinfer as fi
+
+        FlashInferMetadataBuilder = fi.FlashInferMetadataBuilder
     except ImportError:
         return
-    _get_trtllm_gen_workspace_buffer()
+    # Renamed upstream: _get_trtllm_gen_workspace_buffer (≤ foundry branch)
+    # → _get_trtllm_workspace_buffer (main, 2026-07).
+    get_ws = getattr(fi, "_get_trtllm_workspace_buffer", None) or getattr(
+        fi, "_get_trtllm_gen_workspace_buffer", None
+    )
+    if get_ws is not None:
+        get_ws()
     if metadata_builders:
         for b in metadata_builders:
             if isinstance(b, FlashInferMetadataBuilder):
@@ -375,6 +380,16 @@ def setup_ld_preload_env() -> None:
     mode = get_graph_extension_mode()
     if mode != CUDAGraphExtensionMode.NONE:
         os.environ["FOUNDRY_MODE"] = mode.value
+
+    # Early region reserve: on LOAD the hook claims [base, base+region_size)
+    # right after context creation, before module loading can trigger the
+    # CUDA driver's lazily-placed VA arena. Size must equal region_size
+    # exactly so setup_graph_extension's set_allocation_region call is an
+    # idempotent no-op against the early reservation.
+    cfg = get_config()
+    if cfg is not None and mode != CUDAGraphExtensionMode.NONE:
+        os.environ["FOUNDRY_EARLY_RESERVE_BASE"] = hex(cfg.base_addr)
+        os.environ["FOUNDRY_EARLY_RESERVE_SIZE"] = str(parse_size(cfg.region_size))
 
     # Overwrite every spawn site — child reads it on entry.
     os.environ["FOUNDRY_SPAWN_T0_NS"] = str(time.perf_counter_ns())

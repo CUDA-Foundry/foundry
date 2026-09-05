@@ -1,0 +1,9 @@
+mode = "save"
+base_addr = 0x600000000000
+region_size = "256GB"
+workspace_root = "foundry_archive_ipc"
+scratch_space_size = "4096MB"
+# REQUIRED for the EP/IPC recipe — DeepEP low-latency still allocates its RDMA
+# buffer on the NVSHMEM symmetric heap (the NVL buffer is the cudaIpc path).
+# Point this at the libnvshmem_host.so built by vllm/tools/ep_kernels.
+nvshmem_host_path = "/data/liuxs/workarea/foundry-org/vllm/tools/ep_kernels/ep_kernels_workspace/nvshmem/lib/libnvshmem_host.so"
