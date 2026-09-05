@@ -89,6 +89,7 @@ enum CudaDriverAPIIndex {
   CUDA_ENTRY_cuLinkDestroy,
   CUDA_ENTRY_cuModuleGetGlobal,
   CUDA_ENTRY_cuLibraryGetGlobal,
+  CUDA_ENTRY_cuPointerSetAttribute,
   CUDA_ENTRY_END
 };
 
@@ -135,6 +136,7 @@ static cuda_driver_entry_t cuda_driver_entry_table[] = {{nullptr, "cuModuleLoadD
                                                         {nullptr, "cuLinkDestroy"},
                                                         {nullptr, "cuModuleGetGlobal_v2"},
                                                         {nullptr, "cuLibraryGetGlobal"},
+                                                        {nullptr, "cuPointerSetAttribute"},
                                                         {nullptr, nullptr}};
 
 #define CUDA_DRIVER_CALL(table, idx) (table[idx].fn_ptr)
@@ -2222,6 +2224,8 @@ static void* find_symbol_by_cuda_version(const char* symbol, int cudaVersion) {
     return (void*)cuMemAddressReserve;
   } else if (strcmp(symbol, "cuMemAddressFree") == 0) {
     return (void*)cuMemAddressFree;
+  } else if (strcmp(symbol, "cuPointerSetAttribute") == 0) {
+    return (void*)cuPointerSetAttribute;
   } else if (strcmp(symbol, "cuIpcGetMemHandle") == 0) {
     return (void*)cuIpcGetMemHandle;
   } else if (strcmp(symbol, "cuIpcOpenMemHandle") == 0) {
@@ -2379,6 +2383,10 @@ CUresult cuMemAlloc_v2(CUdeviceptr* dptr, size_t bytesize) {
   prop.location.id = device;
   // Enable IPC via VMM shareable handles (POSIX file descriptor on Linux)
   prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+  // Region memory backs cudaMalloc'd buffers that NCCL/DeepEP may register
+  // for GPUDirect RDMA (ncclCommWindowRegister); without this flag the
+  // registration fails (DOCA error 21).
+  prop.allocFlags.gpuDirectRDMACapable = 1;
 
   CUresult result = mem_create_func(&allocHandle, aligned_size, &prop, 0);
   if (result != CUDA_SUCCESS) {
@@ -2569,6 +2577,7 @@ CUresult cuMemAllocPitch_v2(CUdeviceptr* dptr, size_t* pPitch, size_t WidthInByt
   prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
   prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
   prop.location.id = device;
+  prop.allocFlags.gpuDirectRDMACapable = 1;  // see cuMemAlloc path
 
   result = mem_create_func(&allocHandle, aligned_size, &prop, 0);
   if (result != CUDA_SUCCESS) {
@@ -2807,6 +2816,28 @@ CUresult cuMemAddressReserve(CUdeviceptr* ptr, size_t size, size_t alignment, CU
   return CUDA_SUCCESS;
 }
 
+// DOCA GPUNetIO (NCCL GIN/GDAKI) sets SYNC_MEMOPS on every GPU buffer it
+// registers and treats a failure as fatal. The driver rejects the attribute on
+// cuMemCreate-backed memory (CUDA_ERROR_NOT_SUPPORTED), which is what the hook
+// hands out for cudaMalloc; NCCL's own cuMem windows never set it. Report
+// success in that one case so region memory stays registrable.
+CUresult cuPointerSetAttribute(const void* value, CUpointer_attribute attribute, CUdeviceptr ptr) {
+  typedef CUresult (*cuPointerSetAttribute_t)(const void*, CUpointer_attribute, CUdeviceptr);
+  auto real_func = (cuPointerSetAttribute_t)CUDA_DRIVER_CALL(cuda_driver_entry_table,
+                                                             CUDA_ENTRY_cuPointerSetAttribute);
+  CUresult result = real_func(value, attribute, ptr);
+  if (result == CUDA_ERROR_NOT_SUPPORTED && attribute == CU_POINTER_ATTRIBUTE_SYNC_MEMOPS) {
+#ifdef FOUNDRY_DEBUG
+    fprintf(stderr,
+            "[HOOK] cuPointerSetAttribute(SYNC_MEMOPS) on VMM ptr=0x%llx: not supported, "
+            "reporting success\n",
+            (unsigned long long)ptr);
+#endif
+    return CUDA_SUCCESS;
+  }
+  return result;
+}
+
 CUresult cuMemAddressFree(CUdeviceptr ptr, size_t size) {
   typedef CUresult (*cuMemAddressFree_t)(CUdeviceptr, size_t);
   auto real_func =
@@ -2878,6 +2909,8 @@ void* dlsym(void* handle, const char* symbol) {
       return (void*)cuMemAddressReserve;
     } else if (strcmp(symbol, "cuMemAddressFree") == 0) {
       return (void*)cuMemAddressFree;
+    } else if (strcmp(symbol, "cuPointerSetAttribute") == 0) {
+      return (void*)cuPointerSetAttribute;
     } else if (strcmp(symbol, "cuIpcGetMemHandle") == 0) {
       return (void*)cuIpcGetMemHandle;
     } else if (strcmp(symbol, "cuIpcOpenMemHandle") == 0) {
@@ -3812,6 +3845,10 @@ bool preallocate_region(size_t size) {
   prop.location.id = device;
   // Enable IPC via VMM shareable handles (POSIX file descriptor on Linux)
   prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+  // Region memory backs cudaMalloc'd buffers that NCCL/DeepEP may register
+  // for GPUDirect RDMA (ncclCommWindowRegister); without this flag the
+  // registration fails (DOCA error 21).
+  prop.allocFlags.gpuDirectRDMACapable = 1;
 
   CUresult result = mem_create_func(&allocHandle, aligned_size, &prop, 0);
   if (result != CUDA_SUCCESS) {

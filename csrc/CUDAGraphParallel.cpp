@@ -32,6 +32,7 @@
 #include <chrono>
 #include "hook.h"
 #include "BinaryGraphFormat.h"
+#include "GraphDependencies.h"
 
 namespace {
 
@@ -416,6 +417,14 @@ GraphLoadResult CUDAGraph::build_graph_from_parsed(ParsedGraphData&& parsed, CUc
             C10_CUDA_DRIVER_CHECK(
                 cuKernelSetAttribute(CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, max_shared,
                                      kern, graph->capture_dev_));
+            // cuGraphAddKernelNode validates dynamic smem against the
+            // per-context CUfunction, which does not inherit the CUkernel
+            // attribute (>48KB kernels fail with CUDA_ERROR_INVALID_VALUE).
+            CUfunction ctx_func = nullptr;
+            if (cuKernelGetFunction(&ctx_func, kern) == CUDA_SUCCESS && ctx_func) {
+              C10_CUDA_DRIVER_CHECK(cuFuncSetAttribute(
+                  ctx_func, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, max_shared));
+            }
           }
           if (preferred_carveout >= 0) {
             C10_CUDA_DRIVER_CHECK(
@@ -832,13 +841,8 @@ GraphLoadResult CUDAGraph::build_graph_from_parsed(ParsedGraphData&& parsed, CUc
       di++;
     }
 
-#if (defined(CUDA_VERSION) && CUDA_VERSION >= 13000)
-    CUresult dep_result = cuGraphAddDependencies(cuGraph, from_nodes.data(), to_nodes.data(),
+    CUresult dep_result = add_graph_dependencies(cuGraph, from_nodes.data(), to_nodes.data(),
                                                  edge_data.data(), deps_array.size());
-#else
-    CUresult dep_result = cuGraphAddDependencies_v2(cuGraph, from_nodes.data(), to_nodes.data(),
-                                                    edge_data.data(), deps_array.size());
-#endif
     if (dep_result != CUDA_SUCCESS) {
       fprintf(stderr, "[foundry LOAD ERROR] cuGraphAddDependencies FAILED with error %d\n",
               dep_result);
@@ -1021,6 +1025,11 @@ void CUDAGraph::prepare_on_demand_graph(ParsedGraphData& parsed, CUcontext ctx,
           if (max_shared > 0) {
             C10_CUDA_DRIVER_CHECK(cuKernelSetAttribute(
                 CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, max_shared, kern, dev));
+            CUfunction ctx_func = nullptr;  // see binary path: per-context function too
+            if (cuKernelGetFunction(&ctx_func, kern) == CUDA_SUCCESS && ctx_func) {
+              C10_CUDA_DRIVER_CHECK(cuFuncSetAttribute(
+                  ctx_func, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, max_shared));
+            }
           }
           if (preferred_carveout >= 0) {
             C10_CUDA_DRIVER_CHECK(cuKernelSetAttribute(
@@ -1369,6 +1378,15 @@ void CUDAGraph::prepare_on_demand_graph_binary(const BinaryGraphFile& bin_file,
             C10_CUDA_DRIVER_CHECK(
                 cuKernelSetAttribute(CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
                                      k.max_dynamic_shared_size_bytes, kern, dev));
+            // cuGraphKernelNodeSetParams validates dynamic smem against the
+            // per-context CUfunction, which does not inherit the CUkernel
+            // attribute; a member kernel unseen by any template hits this.
+            CUfunction ctx_func = nullptr;
+            if (cuKernelGetFunction(&ctx_func, kern) == CUDA_SUCCESS && ctx_func) {
+              C10_CUDA_DRIVER_CHECK(
+                  cuFuncSetAttribute(ctx_func, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                                     k.max_dynamic_shared_size_bytes));
+            }
           }
           if (k.preferred_shared_memory_carveout >= 0) {
             C10_CUDA_DRIVER_CHECK(
@@ -2025,6 +2043,9 @@ std::shared_ptr<PendingGraphLoads> start_graph_builds_impl(
         CUDAGraph::prepare_on_demand_graph(tmpl_parsed, main_ctx, shared,
                                            static_cast<int>(tmpl_idx));
         result.graph->on_demand_data_->graph_name = graph_names[tmpl_idx];
+        // Bind the template to the shared exec before any member rewrites the
+        // shared graph's params.
+        result.graph->materialize_on_demand_exec();
 
         double tmpl_ms =
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_tmpl)
@@ -2042,11 +2063,19 @@ std::shared_ptr<PendingGraphLoads> start_graph_builds_impl(
       }
 
       // Phase 2c: Quick linking — associate on-demand graphs with shared execs.
+      const char* lazy_env = std::getenv("FOUNDRY_LAZY_GRAPH_EXEC");
+      const bool lazy_graph_exec = lazy_env && lazy_env[0] == '1';
       for (size_t i = 0; i < num; ++i) {
         if (template_for[i] == SIZE_MAX)
           continue;
         size_t tmpl_idx = template_for[i];
         CUDAGraph::link_on_demand_shared_exec(*all_parsed[i].graph, shared_execs.at(tmpl_idx));
+        // Default: instantiate every member's exec now (~5 ms per ~1000-node
+        // graph) so no replay ever stalls. FOUNDRY_LAZY_GRAPH_EXEC=1 defers
+        // it to each graph's first replay and shortens load instead.
+        if (!lazy_graph_exec) {
+          all_parsed[i].graph->materialize_on_demand_exec();
+        }
       }
 
       double phase2_ms =

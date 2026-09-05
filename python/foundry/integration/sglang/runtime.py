@@ -220,4 +220,12 @@ def setup_ld_preload_env() -> None:
     mode = get_graph_extension_mode()
     if mode != CUDAGraphExtensionMode.NONE:
         os.environ["FOUNDRY_MODE"] = mode.value
+        # NCCL registers user buffers of graph-captured collectives (above a
+        # size threshold) and the kernels then read peers' remote addresses
+        # from an array NCCL fills on the host at capture time. A restored
+        # graph replays those kernels without the registration, so the array
+        # holds garbage at LOAD (illegal address in the DP-attention all-gather
+        # at bs>=4 with NCCL 2.30). Keep every size on the unregistered path.
+        os.environ.setdefault("NCCL_GRAPH_REGISTER", "0")
+        os.environ.setdefault("NCCL_LOCAL_REGISTER", "0")
     os.environ["FOUNDRY_SPAWN_T0_NS"] = str(time.perf_counter_ns())

@@ -43,7 +43,8 @@ def _ep_lazy_init_needed() -> bool:
     try:
         from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 
-        return get_moe_a2a_backend().is_deepep()
+        backend = get_moe_a2a_backend()
+        return backend.is_deepep() or backend.is_deepep_v2()
     except Exception:
         return False
 

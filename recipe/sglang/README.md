@@ -58,6 +58,7 @@ model or topology before SAVE.
 | Data parallel | `serve_qwen3-1.7b_dp.sh` | Qwen3-1.7B | one full replica/rank; `NCCL_CUMEM_ENABLE=0`/`NCCL_NVLS_ENABLE=0` |
 | Expert parallel | `serve_qwen3-30ba3b_ep.sh` | Qwen3-30B-A3B | DP-attention + DeepEP; fa3 backend; `SGL_MODEL=Qwen/Qwen3-30B-A3B-FP8` for FP8 |
 | Expert parallel, TP attention | `serve_qwen3-30ba3b_ep_tpattn.sh` | Qwen3-30B-A3B | symm-mem allreduce + DeepEP (vLLM-shaped EP); `foundry-0.5.18` branch only (per-phase cuda-graph flags) |
+| Expert parallel, DeepEP v2 | `serve_qwen3-30ba3b-fp8_ep_v2.sh` | Qwen3-30B-A3B-FP8 | NCCL symmetric windows + GIN instead of NVSHMEM; needs NCCL >= 2.30.7 (see below) |
 
 ## Installation
 
@@ -182,6 +183,33 @@ DeepEP low-latency caps dispatch at that per-rank token count (and asserts
 `(n+1)*2 <= NVSHMEM_QP_DEPTH`); keep it and `--chunked-prefill-size` identical between
 SAVE and LOAD so the captured graphs match.
 
+## DeepEP v2 (NCCL)
+
+`serve_qwen3-30ba3b-fp8_ep_v2.sh <ep_size> [--save|--load]` runs the MoE
+all-to-all over DeepEP v2 (`--moe-a2a-backend deepep_v2`), i.e. NCCL
+symmetric-memory windows and NCCL GIN (GDAKI/DOCA) rather than NVSHMEM.
+Prototype status: validated on H100 EP=2/EP=4 with all 256 decode graphs.
+
+Extra requirements:
+
+```bash
+# sgl-deep-ep's ElasticBuffer is compiled against NCCL 2.30.7 (torch pins 2.29.7)
+pip install --no-deps nvidia-nccl-cu13==2.30.7
+# 2.30.7 is a cuda13.3 build: on a 580.x (CUDA 13.0) host driver add the
+# forward-compat library and put it first on LD_LIBRARY_PATH
+apt-get install cuda-compat-13-3 && export LD_LIBRARY_PATH=/usr/local/cuda-13.3/compat:$LD_LIBRARY_PATH
+```
+
+Any later `pip install -e` of foundry re-resolves torch's NCCL pin; use
+`--no-deps` or re-pin 2.30.7 afterwards.
+
+What foundry does for v2 (all automatic): creates the `ElasticBuffer` at the
+same pre-capture point on SAVE and LOAD (`_bootstrap_deepep_v2_buffer`),
+reports success for `cuPointerSetAttribute(SYNC_MEMOPS)` on region memory
+(DOCA requires it), and sets `NCCL_GRAPH_REGISTER=0`/`NCCL_LOCAL_REGISTER=0`
+so no collective in a captured graph depends on registration state that a
+restored graph cannot replay. Do not force `NCCL_CUMEM_ENABLE=0` with v2.
+
 ## Archive layout
 
 ```
@@ -204,3 +232,4 @@ For DP / EP each rank gets its own `rank_<N>/`.
 | EP replay `illegal memory access` / `nvshmemx_cumodule_init not found` | `libnvshmem_host.so.3` not preloaded — foundry couldn't auto-detect the `nvidia-nvshmem` wheel. Confirm it's installed (`pip show nvidia-nvshmem-cu13`), or set `nvshmem_host_path` in both TOMLs. |
 | `NVSHMEM device library version does not match with NVSHMEM host library version`, then segfault | A custom `nvshmem_host_path` in the TOMLs points at a different NVSHMEM build than the one inside the `sgl-deep-ep` wheel. Remove the override; foundry's auto-detected `nvidia-nvshmem` wheel matches. |
 | `nvshmem_qp_depth >= (num_max_dispatch_tokens_per_rank + 1) * 2` | `SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK` too high for `NVSHMEM_QP_DEPTH`; lower it or raise the QP depth. |
+| TP/EP LOAD aborts `[HOOK] ERROR: cuLinkAddData failed for segment 0 with error 209` (SAVE may log the same during pre-link); DP unaffected | Driver too old for the CUDA version NCCL was built with. Foundry device-links NCCL's kernel library on reload, and the driver's linker rejects fatbins from a newer toolkit even though `cuLibraryLoadData` (plain sglang) accepts them. Compare `nvidia-smi` (driver CUDA version) against the `+cudaX.Y` in `NCCL version 2.29.7+cuda13.2` in the worker log — the torch 2.13 cu130 wheel pins a 13.2-built NCCL, so a 13.0 driver (580.x) fails while 595.x works. After installing NCCL 2.30.7 (a cuda13.3 build) for DeepEP v2, *every* recipe, TP and EP included, needs the CUDA 13.3 compat library (or a 13.3-capable driver): with the 13.2 compat lib, the TP SAVE logs `cuLinkAddData failed ... 209 during pre-link` for NCCL's 128-segment device library and the LOAD then aborts. Fix: upgrade the driver, or install NVIDIA's forward-compat package (`apt-get install cuda-compat-13-2`, then `LD_LIBRARY_PATH=/usr/local/cuda-13.2/compat:$LD_LIBRARY_PATH`). Downgrading NCCL to a 13.0 build is not an option: torch 2.13 needs `ncclCommResume` (>= 2.29). |

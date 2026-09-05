@@ -167,7 +167,24 @@ struct CUDAGraph {
     int graph_id = -1;
     std::string graph_name;  // e.g. filename for debug messages
     std::vector<OnDemandNodeUpdate> updates;
+    // Exec this graph launches. The template aliases the shared exec (bound at
+    // load); each on-demand member gets its own exec instantiated on its first
+    // replay (materialize_on_demand_exec). Nothing calls cuGraphExecUpdate:
+    // an exec updated in place launches every node measurably slower.
+    CUgraphExec own_exec = nullptr;
+    bool owns_exec = false;
+
+    ~OnDemandData();
   };
+
+  // Apply this graph's node params/attrs onto the shared template CUgraph.
+  void apply_on_demand_updates();
+
+  // Give this graph an exec to launch: the shared exec if it is the template
+  // (call at load, before any member rewrites the shared graph), otherwise a
+  // fresh cuGraphInstantiate of the shared graph carrying this graph's params
+  // (called lazily by replay).
+  void materialize_on_demand_exec();
 
   static GraphLoadResult build_graph_from_parsed(ParsedGraphData&& parsed, CUcontext ctx,
                                                  ReconstructTensorFn reconstruct_fn,

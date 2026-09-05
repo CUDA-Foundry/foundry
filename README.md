@@ -128,6 +128,9 @@ Verbose C++ logging (allocator hook and graph replay) is gated behind a
 single compile-time flag, `FOUNDRY_DEBUG`. Uncomment the
 `// #define FOUNDRY_DEBUG` line at the top of `csrc/hook.cpp` or
 `csrc/CUDAGraph.cpp` (or build with `-DFOUNDRY_DEBUG`) and reinstall.
+With the flag on, every LOAD also logs a per-graph check that the restored
+edge records (PDL programmatic edges) survived insertion; see
+[`docs/pdl-edge-batching.md`](docs/pdl-edge-batching.md).
 
 ## Quick Start
 

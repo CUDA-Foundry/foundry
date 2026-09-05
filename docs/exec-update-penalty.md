@@ -6,6 +6,10 @@ batch size (captured 4641/7187 tok/s vs restored 3761/6302 at bs16/32).
 
 ## Contributor 1 — PDL edges discarded (fixed)
 
+> Update 2026-09-05: even with the ports serialized, libcuda 580-610 dropped
+> them again at insertion time (bulk edge-data broadcast). See
+> [`pdl-edge-batching.md`](pdl-edge-batching.md).
+
 FA3 decode on Hopper launches with Programmatic Dependent Launch: the
 `prepare_varlen_num_blocks` → fwd → combine overlap is captured as
 `CUgraphEdgeData` programmatic ports (28 edges/graph on Qwen3-1.7B:

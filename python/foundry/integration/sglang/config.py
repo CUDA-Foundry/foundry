@@ -28,6 +28,10 @@ class CUDAGraphExtensionConfig:
     workspace_root: str = "foundry_archive"
     workspace_dir: str | None = None
     scratch_space_size: str = "64MB"
+    # SAVE: group same-topology graphs under one template with on-demand
+    # members. False makes every graph its own template so LOAD rebuilds each
+    # from its full node list (slower load, no shared-graph re-parameterization).
+    graph_templates: bool = True
 
     @classmethod
     def from_toml(cls, path: str | Path) -> CUDAGraphExtensionConfig:
@@ -53,6 +57,7 @@ class CUDAGraphExtensionConfig:
             region_size=data.get("region_size", cls.region_size),
             workspace_root=data.get("workspace_root", cls.workspace_root),
             scratch_space_size=data.get("scratch_space_size", cls.scratch_space_size),
+            graph_templates=bool(data.get("graph_templates", cls.graph_templates)),
         )
 
     @staticmethod
