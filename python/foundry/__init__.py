@@ -7,7 +7,6 @@
 # CUDAGraph with the raw pybind class and breaks `foundry.graph(...)`
 # (raw capture_begin requires a positional `pool`; the wrapper defaults it).
 # isort: off
-from .ops import *
 from .allocation_region import (
     allocation_region,
     free_preallocated_region,

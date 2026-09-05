@@ -93,7 +93,7 @@ windows). Every SGLang configuration is validated with the full decode-graph set
 (batch sizes 1..256) for restore time, per-token latency and greedy-output
 equality against unmodified SGLang; see [`recipe/sglang/README.md`](recipe/sglang/README.md#validation).
 
-The adapted vLLM / SGLang / TensorRT-LLM forks will be released alongside this repo at `foundry-org/vllm`, `foundry-org/sglang`, `foundry-org/TensorRT-LLM`.
+The adapted SGLang fork is published at [`foundry-org/sglang`](https://github.com/foundry-org/sglang), branch `foundry` (v0.0.3 pairs with commit `f1d688e52`; the 0.0.2-era integration stays on `foundry-0.0.2`). The vLLM and TensorRT-LLM forks will follow at `foundry-org/vllm` and `foundry-org/TensorRT-LLM`.
 
 ### Performance
 

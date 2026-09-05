@@ -32,8 +32,10 @@ windows) support.
 
 ## Engine integrations
 
-- **SGLang** — single GPU, DP, TP (symm-mem), EP (DeepEP low-latency) and
-  EP with DeepEP v2 all validated end-to-end with the shipped recipes
+- **SGLang** — pairs with `foundry-org/sglang` branch `foundry` at `f1d688e52`
+  (upstream main of 2026-09-01, post-0.5.18, plus the integration; the 0.0.2-era
+  fork is kept on `foundry-0.0.2`). Single GPU, DP, TP (symm-mem), EP (DeepEP
+  low-latency) and EP with DeepEP v2 all validated end-to-end with the shipped recipes
   (`recipe/sglang/`, see its Validation section). Recipes gained an
   `SGL_EXTRA_ARGS` passthrough and a DeepEP v2 script; `graph_templates` TOML
   knob to disable topology templating.

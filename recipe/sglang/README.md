@@ -3,13 +3,15 @@
 End-to-end serve scripts for SAVE / LOAD of CUDA graphs through the foundry SGLang
 integration.
 
-Current target: the fork's **`foundry`** branch (integration rebased onto
+Current target: the fork's **`foundry`** branch — foundry v0.0.3 pairs with commit
+`f1d688e52`; the 0.0.2-era integration is kept on `foundry-0.0.2` (integration rebased onto
 upstream-synced `main`, post-0.5.18), which pins **torch 2.13.0+cu130** and ships the
 whole kernel stack as wheels. Foundry `dev >= ac6104f` builds against torch 2.11 and
-2.13 alike (version-guarded csrc). Validated on this pairing: single-GPU, DP=2, and
-EP=2 (Qwen3-30B-A3B + DeepEP low-latency) save/load/query. The older `foundry`
-branch (~0.5.12 base, torch 2.11) still works with foundry `dev` — the differences
-called out below are marked with the branch they apply to. All scripts in this directory share the same pair of foundry TOML files
+2.13 alike (version-guarded csrc). Validated on this pairing (see **Validation**):
+single GPU, DP=2, TP=2, EP=2 with DeepEP low-latency and with DeepEP v2 —
+save/load, TPOT and greedy-output parity against plain SGLang. The 0.0.2-era
+`foundry-0.0.2` branch (~0.5.12 base, torch 2.11) still works with foundry `dev` —
+the differences called out below are marked with the branch they apply to. All scripts in this directory share the same pair of foundry TOML files
 (`foundry_save.toml` / `foundry_load.toml`) — pick a script for your model + parallelism,
 run `--save`, then `--load`, then query. The integration code is in
 [`../../python/foundry/integration/sglang/`](../../python/foundry/integration/sglang/);
@@ -48,8 +50,8 @@ appends extra `sglang serve` flags verbatim, e.g.
 prefill-graph policy as a foundry LOAD (foundry restores decode graphs only).
 
 The scripts use `--cuda-graph-max-bs` (deprecated alias of
-`--cuda-graph-max-bs-decode` on the current fork) so the scripts also run on the older
-supported sglang branches.
+`--cuda-graph-max-bs-decode` on the current fork) so the scripts also run on the
+0.0.2-era fork branch `foundry-0.0.2`.
 
 A single SAVE pass is enough — SGLang has no startup profile-forward, so there is no
 non-determinism that requires a two-pass save (unlike the vLLM recipe).
@@ -162,7 +164,7 @@ nothing to build. Two things still matter:
   old vLLM ep_kernels workspace) aborts every rank at DeepEP init with
   `NVSHMEM device library version does not match with NVSHMEM host library version`.
 
-(Older `foundry` branch only: DeepEP @ `9af0e0d`, `sgl-deep-gemm >= 0.1.2` and
+(`foundry-0.0.2` branch only: DeepEP @ `9af0e0d`, `sgl-deep-gemm >= 0.1.2` and
 `flash-attn-3` were hand-built — see that branch's README.)
 
 ```bash
@@ -193,7 +195,8 @@ SAVE and LOAD so the captured graphs match.
 ## Validation
 
 Every recipe in this directory was run as shipped on 2026-09-05 (8×H100 host, 2 GPUs
-per multi-GPU run, sglang fork branch `foundry`, CUDA 13.3 compat library, NCCL 2.30.7)
+per multi-GPU run, foundry v0.0.3, sglang fork branch `foundry` at `f1d688e52`, CUDA 13.3
+compat library, NCCL 2.30.7)
 through `experimental/recipe_validate.sh`: SAVE, then plain SGLang twice (the noise
 control; `SGL_EXTRA_ARGS="--cuda-graph-backend-prefill disabled"` so it skips prefill
 graphs like a LOAD), then LOAD. Per engine: seconds to `/health`, sglang's own
