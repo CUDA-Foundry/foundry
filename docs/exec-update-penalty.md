@@ -1,5 +1,11 @@
 # Restored-vs-captured graph slowdown — root causes & fixes (2026-07-27)
 
+> Status 2026-09-05: superseded. Contributor 2 is fixed by giving every
+> on-demand member its own `CUgraphExec` (no `cuGraphExecUpdate` anywhere);
+> see [`graph-templates.md`](graph-templates.md). The piecewise-template idea
+> below was not needed. The PDL edge loss (Contributor 1) had a second cause,
+> see [`pdl-edge-batching.md`](pdl-edge-batching.md).
+
 Report: restored (LOADed) graphs stably ~10% slower than captured ones.
 Reproduced on Qwen3-1.7B, 1 GPU (H200): bs16 −19%, bs32 −12%, shrinking with
 batch size (captured 4641/7187 tok/s vs restored 3761/6302 at bs16/32).

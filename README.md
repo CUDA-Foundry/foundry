@@ -63,9 +63,9 @@ flowchart LR
 
 - **Memory.** Every device allocation is funneled into a single VMM region `[base_addr, base_addr + region_size)`. A monotonic cursor gives every tensor a byte-deterministic offset; the underlying physical mapping is done with `cuMemCreate` + `cuMemMap`.
 - **Modules / libraries.** As device code is loaded, the fatbin bytes and the `entry_name → CUfunction` table are recorded.
-- **Captured graphs.** Each captured `CUgraph` is serialized and then grouped with other graphs that share the same topology. One graph per group is kept as the **template** (a fully built `CUgraphExec`); the rest are stored as **on-demand** graphs that share the template's executor and only carry the per-node parameter overrides needed to switch between them.
+- **Captured graphs.** Each captured `CUgraph` is serialized and then grouped with other graphs that share the same topology (same kernels, dependency DAG and cluster dimensions; they differ only in kernel parameters). One graph per group is kept as the **template**; the rest are stored as **on-demand members** that carry only their per-node kernel parameters.
 
-**SAVE** writes all three pieces to an archive. **LOAD** pre-maps the same VMM range, re-loads the same modules from the packed fatbins, instantiates one `CUgraphExec` per topology group as template and prepare node-param sets. It later applies node-param updates on demand — kernel handles embedded inside the captured graphs resolve to the same device addresses they had at SAVE time.
+**SAVE** writes all three pieces to an archive. **LOAD** pre-maps the same VMM range, re-loads the same modules from the packed fatbins, builds each template's `CUgraph` node by node once, and then produces every member by rewriting the template's node parameters and instantiating a **dedicated** `CUgraphExec` (eager by default). No graph is ever mutated after instantiation, so restored graphs replay at native speed; kernel handles embedded in the captured graphs resolve to the same device addresses they had at SAVE time. See [`docs/graph-templates.md`](docs/graph-templates.md) for the design and measurements.
 
 ## Inference-Engine Integrations
 
