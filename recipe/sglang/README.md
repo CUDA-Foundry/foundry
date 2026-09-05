@@ -3,7 +3,7 @@
 End-to-end serve scripts for SAVE / LOAD of CUDA graphs through the foundry SGLang
 integration.
 
-Current target: the fork's **`foundry-0.5.18`** branch (integration rebased onto
+Current target: the fork's **`foundry`** branch (integration rebased onto
 upstream-synced `main`, post-0.5.18), which pins **torch 2.13.0+cu130** and ships the
 whole kernel stack as wheels. Foundry `dev >= ac6104f` builds against torch 2.11 and
 2.13 alike (version-guarded csrc). Validated on this pairing: single-GPU, DP=2, and
@@ -26,7 +26,8 @@ recipe/sglang/
 ├── serve_qwen3-1.7b_tp.sh          # Qwen3-1.7B           tensor parallel (symm-mem allreduce)
 ├── serve_qwen3-1.7b_dp.sh          # Qwen3-1.7B           data parallel
 ├── serve_qwen3-30ba3b_ep.sh        # Qwen3-30B-A3B (MoE)  expert parallel (DeepEP + DP-attention)
-└── serve_qwen3-30ba3b_ep_tpattn.sh # Qwen3-30B-A3B (MoE)  expert parallel, TP attention (symm-mem allreduce)
+├── serve_qwen3-30ba3b_ep_tpattn.sh # Qwen3-30B-A3B (MoE)  expert parallel, TP attention (symm-mem allreduce)
+└── serve_qwen3-30ba3bfp8_ep_v2.sh  # Qwen3-30B-A3B-FP8    expert parallel, DeepEP v2 (NCCL symmetric windows)
 ```
 
 Every script accepts the same trailing `--save` / `--load` flag. Scripts that scale
@@ -38,10 +39,16 @@ bash serve_qwen3-1.7b_tp.sh        <tp_size>   [--save|--load]
 bash serve_qwen3-1.7b_dp.sh        <dp_size>   [--save|--load]
 bash serve_qwen3-30ba3b_ep.sh          <ep_size>   [--save|--load]
 bash serve_qwen3-30ba3b_ep_tpattn.sh   <ep_size>   [--save|--load]
+bash serve_qwen3-30ba3bfp8_ep_v2.sh    <ep_size>   [--save|--load]
 ```
 
+Without `--save`/`--load` a script runs plain SGLang (the baseline). `SGL_EXTRA_ARGS`
+appends extra `sglang serve` flags verbatim, e.g.
+`SGL_EXTRA_ARGS="--cuda-graph-backend-prefill disabled"` to give a baseline the same
+prefill-graph policy as a foundry LOAD (foundry restores decode graphs only).
+
 The scripts use `--cuda-graph-max-bs` (deprecated alias of
-`--cuda-graph-max-bs-decode` on `foundry-0.5.18`) so the same scripts run on both
+`--cuda-graph-max-bs-decode` on the current fork) so the scripts also run on the older
 supported sglang branches.
 
 A single SAVE pass is enough — SGLang has no startup profile-forward, so there is no
@@ -57,8 +64,8 @@ model or topology before SAVE.
 | Tensor parallel | `serve_qwen3-1.7b_tp.sh` | Qwen3-1.7B | torch symm-mem allreduce (`--enable-torch-symm-mem --disable-custom-all-reduce`); mirrors the vLLM TP recipe |
 | Data parallel | `serve_qwen3-1.7b_dp.sh` | Qwen3-1.7B | one full replica/rank; `NCCL_CUMEM_ENABLE=0`/`NCCL_NVLS_ENABLE=0` |
 | Expert parallel | `serve_qwen3-30ba3b_ep.sh` | Qwen3-30B-A3B | DP-attention + DeepEP; fa3 backend; `SGL_MODEL=Qwen/Qwen3-30B-A3B-FP8` for FP8 |
-| Expert parallel, TP attention | `serve_qwen3-30ba3b_ep_tpattn.sh` | Qwen3-30B-A3B | symm-mem allreduce + DeepEP (vLLM-shaped EP); `foundry-0.5.18` branch only (per-phase cuda-graph flags) |
-| Expert parallel, DeepEP v2 | `serve_qwen3-30ba3b-fp8_ep_v2.sh` | Qwen3-30B-A3B-FP8 | NCCL symmetric windows + GIN instead of NVSHMEM; needs NCCL >= 2.30.7 (see below) |
+| Expert parallel, TP attention | `serve_qwen3-30ba3b_ep_tpattn.sh` | Qwen3-30B-A3B | symm-mem allreduce + DeepEP (vLLM-shaped EP); needs the `foundry` branch's per-phase cuda-graph flags |
+| Expert parallel, DeepEP v2 | `serve_qwen3-30ba3bfp8_ep_v2.sh` | Qwen3-30B-A3B-FP8 | NCCL symmetric windows + GIN instead of NVSHMEM; needs NCCL >= 2.30.7 (see below) |
 
 ## Installation
 
@@ -78,14 +85,14 @@ themselves. The standard workspace layout has `foundry/` (this repo) and `sglang
 ```
 
 Use a dedicated env, kept separate from the vLLM env so kernel pins don't clash
-(`foundry-0.5.18` pins torch 2.13; a torch-2.11 env cannot run it — sglang-kernel
+(the `foundry` branch pins torch 2.13; a torch-2.11 env cannot run it — sglang-kernel
 0.4.6+ is built against the torch 2.13 C++ ABI):
 
 ```bash
 python3.12 -m venv venv && source venv/bin/activate
 pip install "torch==2.13.0" --index-url https://download.pytorch.org/whl/cu130
 
-# in-tree sglang fork (branch foundry-0.5.18), editable — this pulls the FULL
+# in-tree sglang fork (branch foundry), editable — this pulls the FULL
 # kernel stack as wheels: flashinfer 0.6.18, sglang-kernel 0.4.6.post1,
 # sgl-deep-ep, sgl-deep-gemm, flash-attn-4. No hand-built kernels remain
 # (fa3 now lives inside sglang-kernel as sgl_kernel.flash_attn).
@@ -132,7 +139,7 @@ pynccl are both replay paths foundry does not support; the TP script disables
 them and enables `--enable-torch-symm-mem`, so every decode-graph allreduce is a
 `symm_mem.two_shot_all_reduce_` (TP=2 on Hopper) on the persistent symmetric
 buffer foundry places deterministically. On hosts without usable multicast (no
-IMEX channels), the `foundry-0.5.18` fork keeps the communicator enabled on the
+IMEX channels), the `foundry` fork keeps the communicator enabled on the
 two-shot path — upstream sglang would silently fall back to in-graph NCCL,
 which breaks LOAD. If a load aborts with `TorchSymmMemCommunicator ...
 communicator is not available` in the log, the allreduce fell back to NCCL and
@@ -140,7 +147,7 @@ the archive is not replayable.
 
 ## Run (expert parallel / DeepEP)
 
-On `foundry-0.5.18` the EP kernel stack is entirely wheel-provided by the sglang
+On the `foundry` branch the EP kernel stack is entirely wheel-provided by the sglang
 install above (`sgl-deep-ep`, `sgl-deep-gemm`; fa3 inside `sglang-kernel`) — there is
 nothing to build. Two things still matter:
 
@@ -173,7 +180,7 @@ allreduce routed through torch symm-mem (`--enable-torch-symm-mem`, custom AR
 off) plus `--cuda-graph-backend-prefill disabled` — the prefill-graph disable
 matters even for baseline runs of this topology, because without DP-attention
 every rank dispatches the full prefill chunk and prefill-graph capture trips
-DeepEP's `num_max_dispatch_tokens_per_rank` assert. `foundry-0.5.18` branch
+DeepEP's `num_max_dispatch_tokens_per_rank` assert. `foundry` branch
 only (uses the per-phase cuda-graph flags).
 
 The EP script sets `--enable-dp-attention --moe-a2a-backend deepep --deepep-mode
@@ -183,9 +190,39 @@ DeepEP low-latency caps dispatch at that per-rank token count (and asserts
 `(n+1)*2 <= NVSHMEM_QP_DEPTH`); keep it and `--chunked-prefill-size` identical between
 SAVE and LOAD so the captured graphs match.
 
+## Validation
+
+Every recipe in this directory was run as shipped on 2026-09-05 (8×H100 host, 2 GPUs
+per multi-GPU run, sglang fork branch `foundry`, CUDA 13.3 compat library, NCCL 2.30.7)
+through `experimental/recipe_validate.sh`: SAVE, then plain SGLang twice (the noise
+control; `SGL_EXTRA_ARGS="--cuda-graph-backend-prefill disabled"` so it skips prefill
+graphs like a LOAD), then LOAD. Per engine: seconds to `/health`, sglang's own
+`cuda_graph decode` timing (capture on SAVE / baseline, restore on LOAD), a TPOT sweep
+(`experimental/bench_sglang.sh`, 3 runs, 64 output tokens) and 32 fixed greedy prompts
+at concurrency 1 / 8 / 32 compared word-for-word.
+
+| Recipe | Model | Graphs | Capture → restore | To `/health`: SGLang / LOAD | TPOT p50 LOAD vs SGLang (bs 1 / 8 / 32 / 128) |
+|---|---|---:|---:|---:|---|
+| `serve_qwen3-mini.sh` | Qwen3-1.7B | 52 | 3.3 s → 0.43 s | 27.1 s / 25.1 s | -1.0 / -0.5 / -0.3 / -1.8 % |
+| `serve_qwen3-1.7b_dp.sh 2` | Qwen3-1.7B | 52 | 3.2 s → 0.36 s | 33.1 s / 33.1 s | -1.5 / +0.3 / -0.6 / +1.4 % |
+| `serve_qwen3-1.7b_tp.sh 2` | Qwen3-1.7B | 20 | 2.5 s → 0.29 s | 27.1 s / 27.1 s | -1.3 / -1.2 / +0.5 / +0.4 % |
+| `serve_qwen3-30ba3b_ep.sh 2` | Qwen3-30B-A3B | 20 | 6.0 s → 0.62 s | 43.1 s / 43.1 s | +0.5 / +0.0 / +0.4 / +0.3 % |
+| `serve_qwen3-30ba3bfp8_ep_v2.sh 2` | Qwen3-30B-A3B-FP8 | 20 | 7.0 s → 0.42 s | 43.1 s / 41.2 s | +0.7 / +0.7 / +0.5 / -0.5 % |
+
+Greedy completions: identical to plain SGLang for every recipe at concurrency 1 and,
+except one prompt each on dp/tp at concurrency 32 and the MoE recipes at 8/32, at
+higher concurrency too; in those cells the two plain-SGLang runs disagree with each
+other by the same amount (batch composition changes accumulation order), so the
+restored graphs sit inside SGLang's own run-to-run noise.
+
+With the recipes' default graph sets (20–52 decode graphs) capture is only a few
+seconds, so time-to-health is dominated by weight loading and the differences above
+are small; with all 256 decode graphs (`--cuda-graph-max-bs 256 --disable-cuda-graph-padding`)
+restore saves 25–50 s per engine start (see the top-level README's Performance table).
+
 ## DeepEP v2 (NCCL)
 
-`serve_qwen3-30ba3b-fp8_ep_v2.sh <ep_size> [--save|--load]` runs the MoE
+`serve_qwen3-30ba3bfp8_ep_v2.sh <ep_size> [--save|--load]` runs the MoE
 all-to-all over DeepEP v2 (`--moe-a2a-backend deepep_v2`), i.e. NCCL
 symmetric-memory windows and NCCL GIN (GDAKI/DOCA) rather than NVSHMEM.
 Prototype status: validated on H100 EP=2/EP=4 with all 256 decode graphs.

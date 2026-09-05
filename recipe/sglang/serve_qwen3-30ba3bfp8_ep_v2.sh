@@ -1,7 +1,8 @@
 #!/bin/bash
 # Qwen3-30B-A3B-FP8, expert parallel over DeepEP v2 (NCCL symmetric-memory
 # windows + GIN) with DP-attention. Prototype recipe (Sep 2026).
-# Usage: CUDA_VISIBLE_DEVICES=0,1 bash serve_qwen3-30ba3b-fp8_ep_v2.sh <ep_size> [--save|--load]
+# Usage: CUDA_VISIBLE_DEVICES=0,1 bash serve_qwen3-30ba3bfp8_ep_v2.sh <ep_size> [--save|--load]
+# SGL_EXTRA_ARGS: extra `sglang serve` flags appended verbatim (e.g. \"--cuda-graph-backend-prefill disabled\").
 #
 # Requirements beyond the v1 EP recipe (see README "DeepEP v2"):
 # - nvidia-nccl-cu13 >= 2.30.7 (sgl-deep-ep's ElasticBuffer is built against it);
@@ -67,4 +68,5 @@ sglang serve \
     --chunked-prefill-size 256 \
     --attention-backend fa3 \
     --cuda-graph-max-bs "$CUDA_GRAPH_MAX_BS" \
-    "${FOUNDRY_ARGS[@]}"
+    "${FOUNDRY_ARGS[@]}" \
+    ${SGL_EXTRA_ARGS:-}

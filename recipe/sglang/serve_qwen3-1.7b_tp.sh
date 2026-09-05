@@ -1,13 +1,14 @@
 #!/bin/bash
 # Qwen3-1.7B, tensor parallel with torch symmetric-memory allreduce.
 # Usage: CUDA_VISIBLE_DEVICES=0,1 bash serve_qwen3-1.7b_tp.sh <tp_size> [--save|--load]
+# SGL_EXTRA_ARGS: extra `sglang serve` flags appended verbatim (e.g. \"--cuda-graph-backend-prefill disabled\").
 #
 # Custom all-reduce registers IPC buffers per captured graph and in-graph
 # pynccl allreduce doesn't replay — with both off, every decode-graph
 # allreduce dispatches to TorchSymmMemCommunicator (two_shot_all_reduce_ at
 # TP=2 on Hopper) on a persistent symmetric buffer + peer-pointer arrays
 # foundry places deterministically. Mirrors recipe/vllm/serve_qwen3-1.7b_tp.sh.
-# Requires the fork's two-shot-without-multicast fix (foundry-0.5.18 branch)
+# Requires the fork's two-shot-without-multicast fix (`foundry` branch)
 # on hosts where multicast is unavailable (e.g. no IMEX channels).
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -58,4 +59,5 @@ sglang serve \
     --disable-radix-cache \
     --attention-backend flashinfer \
     --cuda-graph-max-bs 128 \
-    "${FOUNDRY_ARGS[@]}"
+    "${FOUNDRY_ARGS[@]}" \
+    ${SGL_EXTRA_ARGS:-}

@@ -3,6 +3,7 @@
 # the attention allreduce runs through torch symmetric memory instead of using
 # DP-attention. This mirrors the vLLM EP topology (recipe/vllm/*_ep.sh).
 # Usage: CUDA_VISIBLE_DEVICES=0,1 bash serve_qwen3-30ba3b_ep_tpattn.sh <ep_size> [--save|--load]
+# SGL_EXTRA_ARGS: extra `sglang serve` flags appended verbatim (e.g. \"--cuda-graph-backend-prefill disabled\").
 #
 # vs serve_qwen3-30ba3b_ep.sh: --dp-size/--enable-dp-attention are replaced by
 # --disable-custom-all-reduce --enable-torch-symm-mem (decode-graph allreduce =
@@ -11,7 +12,7 @@
 # DP-attention every rank dispatches the full prefill chunk, and prefill-graph
 # capture trips DeepEP's num_max_dispatch_tokens_per_rank assert even on
 # baseline sglang. Requires the fork's two-shot-without-multicast fix
-# (foundry-0.5.18) on hosts without IMEX channels.
+# (`foundry` branch) on hosts without IMEX channels.
 #
 # The EP kernel stack (sgl-deep-ep, sgl-deep-gemm, fa3 inside sglang-kernel) is
 # wheel-provided by the sglang install; NVSHMEM auto-detects from the
@@ -20,7 +21,7 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 EP_SIZE=${1:?Usage: $0 <ep_size> [--save|--load]}
-# bf16 is the validated default on foundry-0.5.18 (sgl-deep-gemm's masked bf16
+# bf16 is the validated default on the `foundry` branch (sgl-deep-gemm's masked bf16
 # GEMM is present in the wheel); override for FP8: SGL_MODEL=Qwen/Qwen3-30B-A3B-FP8.
 MODEL_NAME="${SGL_MODEL:-Qwen/Qwen3-30B-A3B}"
 HOST="0.0.0.0"
@@ -79,4 +80,5 @@ sglang serve \
     --chunked-prefill-size 256 \
     --attention-backend fa3 \
     --cuda-graph-max-bs 128 \
-    "${FOUNDRY_ARGS[@]}"
+    "${FOUNDRY_ARGS[@]}" \
+    ${SGL_EXTRA_ARGS:-}

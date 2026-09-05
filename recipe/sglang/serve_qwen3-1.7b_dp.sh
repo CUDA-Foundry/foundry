@@ -1,6 +1,7 @@
 #!/bin/bash
 # Qwen3-1.7B, data parallel (one full replica per DP rank).
 # Usage: CUDA_VISIBLE_DEVICES=0,1 bash serve_qwen3-1.7b_dp.sh <dp_size> [--save|--load]
+# SGL_EXTRA_ARGS: extra `sglang serve` flags appended verbatim (e.g. \"--cuda-graph-backend-prefill disabled\").
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -49,4 +50,5 @@ sglang serve \
     --disable-radix-cache \
     --attention-backend flashinfer \
     --cuda-graph-max-bs 512 \
-    "${FOUNDRY_ARGS[@]}"
+    "${FOUNDRY_ARGS[@]}" \
+    ${SGL_EXTRA_ARGS:-}

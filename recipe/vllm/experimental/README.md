@@ -3,7 +3,7 @@
 End-to-end SAVE / LOAD recipe for **Qwen3-30B-A3B** expert-parallel where DeepEP's
 intranode NVLink buffer stays on the **legacy CUDA-IPC** path
 (`cudaIpcGetMemHandle` / `cudaIpcOpenMemHandle`) under foundry, instead of the
-default fabric/NVSHMEM-only path used by `recipe/vllm/serve_qwen3-30ba3b_ep.sh`.
+default fabric/NVSHMEM-only path used by `../serve_qwen3-30ba3b_ep.sh`.
 
 This exercises foundry's **VMM-IPC translation layer**: DeepEP's NVL buffer is a
 foundry VMM (`cuMemCreate`) allocation that legacy IPC can't share, so the hook
@@ -14,7 +14,7 @@ own VA range. This is the path that lets foundry SAVE/LOAD work on machines
 with `cuMemImportFromShareableHandle ... error 999`.
 
 ```
-recipe/experimental/
+recipe/vllm/experimental/
 ├── README.md                          # this file
 ├── foundry_save.toml                  # SAVE config (workspace_root = "foundry_archive_ipc")
 ├── foundry_load.toml                  # LOAD config (same workspace_root)
@@ -22,7 +22,7 @@ recipe/experimental/
 ```
 
 It is the standard `recipe/vllm` EP recipe plus one switch — `FOUNDRY_DEEPEP_NVL_IPC=1`
-— so read [`../vllm/README.md`](../vllm/README.md) first for installation, the
+— so read [`../README.md`](../README.md) first for installation, the
 two-pass SAVE workflow, the archive layout, and the shared EP flags. Only the
 IPC-specific deltas are documented here.
 
@@ -55,9 +55,9 @@ SAVE pass 2, and LOAD all pass the identical path string → identical cache has
 
 ```bash
 cd <workspace>          # one canonical path for all three phases
-bash foundry/recipe/experimental/serve_qwen3-30ba3b_ipc_ep.sh 2 --save
-bash foundry/recipe/experimental/serve_qwen3-30ba3b_ipc_ep.sh 2 --save
-bash foundry/recipe/experimental/serve_qwen3-30ba3b_ipc_ep.sh 2 --load
+bash foundry/recipe/vllm/experimental/serve_qwen3-30ba3b_ipc_ep.sh 2 --save
+bash foundry/recipe/vllm/experimental/serve_qwen3-30ba3b_ipc_ep.sh 2 --save
+bash foundry/recipe/vllm/experimental/serve_qwen3-30ba3b_ipc_ep.sh 2 --load
 ```
 
 ## Workflow
