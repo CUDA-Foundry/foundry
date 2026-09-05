@@ -17,6 +17,8 @@ from .allocation_region import (
     resume_allocation_region,
     set_current_alloc_offset,
 )
+
+from .ops import *  # isort: skip
 from .graph import (
     CUDAGraph,
     graph,
