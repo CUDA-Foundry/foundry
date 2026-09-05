@@ -203,7 +203,7 @@ TP attention is unsupported (its NCCL all-reduce is incompatible with the VMM re
   surfaced only on sglang EP.
 
 See [`../../recipe/sglang/README.md`](../../recipe/sglang/README.md) for the EP serve
-config and kernel-stack notes (wheel-provided on `foundry-0.5.18`; hand-built
+config and kernel-stack notes (wheel-provided on the `foundry` branch; hand-built
 deep_ep `9af0e0d` / sgl-deep-gemm ≥0.1.2 / fa3 on the older branch).
 
 ## Patch idiom

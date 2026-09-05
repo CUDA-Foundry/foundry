@@ -10,8 +10,8 @@ Tested on single-GPU Qwen3-1.7B / 4B / 14B and **data-parallel (DP=2)** Qwen3-1.
 |---|:---:|---|
 | Single GPU | ✅ | Qwen3-1.7B / 4B / 14B |
 | Data parallel (DP) | ✅ | One full replica per rank; validated DP=2. Requires the per-rank device binding (below) and `NCCL_CUMEM_ENABLE=0` / `NCCL_NVLS_ENABLE=0`. |
-| Tensor parallel (TP) | 🚧 | Deterministic NCCL memory layout is under construction. |
-| Expert parallel (DeepEP) | ✅ | Validated EP=2 on Qwen3-30B-A3B (bf16, `foundry-0.5.18` branch) and Qwen3-30B-A3B-FP8 (older `foundry` branch); restored decode graphs match baseline throughput. See **Expert parallel** below. |
+| Tensor parallel (TP) | ✅ | torch symmetric-memory allreduce inside the decode graphs (`--enable-torch-symm-mem --disable-custom-all-reduce`); validated TP=2 (Qwen3-1.7B, Qwen3-32B) and TP=4 (Qwen3-32B). Two-shot fallback when multicast is unavailable. |
+| Expert parallel (DeepEP) | ✅ | Validated EP=2 on Qwen3-30B-A3B (bf16) and Qwen3-30B-A3B-FP8 (DeepEP v2), `foundry` branch; restored decode graphs match baseline throughput. See **Expert parallel** below. |
 
 **Expert parallel (DeepEP).** EP runs DP-attention (each rank its own attention — no
 NCCL all-reduce) + DeepEP for the MoE all-to-all (NVSHMEM, foundry-compatible). The

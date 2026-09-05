@@ -1,10 +1,70 @@
-# Foundry 0.0.2
+# Foundry 0.0.3
+
+Restored graphs now run exactly like captured ones. This release closes the
+last per-token latency gap between foundry-restored and natively captured CUDA
+graphs, validates SGLang tensor parallelism, and adds DeepEP v2 (NCCL symmetric
+windows) support.
+
+## Highlights
+
+- **Restored-graph TPOT at parity with native capture.** Two root causes fixed:
+  `cuGraphExecUpdate` on a shared template exec left it permanently slower
+  (now every on-demand member gets its own `cudaGraphInstantiate`, eager by
+  default, `FOUNDRY_LAZY_GRAPH_EXEC=1` to defer), and libcuda 580–610 applying
+  `edge_data[0]` to every edge of a bulk `cuGraphAddDependencies_v2` call,
+  which silently dropped all programmatic-dependent-launch (PDL) edges of a
+  rebuilt graph (now inserted per homogeneous edge record,
+  `include/GraphDependencies.h`, see `docs/pdl-edge-batching.md`). Median TPOT
+  of restored vs unmodified SGLang is within ±0.7 % at bs 1–128 on single GPU,
+  TP2, EP2 and DeepEP v2 EP2 with all 256 decode graphs.
+- **SGLang tensor parallel validated.** torch symmetric-memory allreduce inside
+  the decode graphs, TP=2/4, including a two-shot fallback for hosts without
+  multicast.
+- **DeepEP v2 (NCCL 2.30.7 symmetric windows / GIN) under foundry.** The hook
+  answers `cuPointerSetAttribute(SYNC_MEMOPS)` on VMM memory and marks region
+  allocations GPUDirect-RDMA capable; the SGLang integration bootstraps the v2
+  buffer before capture and disables NCCL graph-time buffer registration.
+  Recipe: `recipe/sglang/serve_qwen3-30ba3bfp8_ep_v2.sh`.
+- **Greedy-output equality checked, not assumed.** 32 prompts × bs 1/8/32
+  against unmodified SGLang run twice: dense TP is bit-identical; MoE configs
+  match one of the two baseline runs in every cell (baseline itself is not
+  run-to-run deterministic at bs ≥ 8).
+
+## Engine integrations
+
+- **SGLang** — single GPU, DP, TP (symm-mem), EP (DeepEP low-latency) and
+  EP with DeepEP v2 all validated end-to-end with the shipped recipes
+  (`recipe/sglang/`, see its Validation section). Recipes gained an
+  `SGL_EXTRA_ARGS` passthrough and a DeepEP v2 script; `graph_templates` TOML
+  knob to disable topology templating.
+- **vLLM** — unchanged; the legacy CUDA-IPC DeepEP recipe moved to
+  `recipe/vllm/experimental/`.
+
+## Fixes
+
+- Member kernels whose smem variant differs from the template's re-target
+  through the per-context `CUfunction` with `MAX_DYNAMIC_SHARED` set
+  (>48 KB DeepGEMM kernels).
+- `setup.py` forwards `FOUNDRY_DEBUG` to the hook's CMake build; with the flag,
+  every LOAD logs a per-graph check that restored edge records survived.
+- Driver/compat notes: `cuLinkAddData ... 209` on LOAD means the userspace
+  CUDA library is older than the toolkit NCCL was built with (NCCL 2.30.7
+  needs a 13.3-capable driver or `cuda-compat-13-3` for every recipe).
+
+## Docs
+
+- `docs/pdl-edge-batching.md` (root cause, fix, driver reproducer), updated
+  `docs/exec-update-penalty.md`, README status and performance tables.
+
+## Previous Releases
+
+## Foundry 0.0.2
 
 SGLang graduates to a fully validated engine. This release brings the SGLang
 integration to parity with vLLM across single GPU, data parallel, and expert
 parallel — with a self-contained recipe and no vLLM build dependency for EP.
 
-## Highlights
+### Highlights
 
 - **SGLang single GPU / DP / EP all validated end-to-end.**
   SAVE → LOAD → query verified on single-GPU Qwen3-1.7B / 4B / 14B,
@@ -23,7 +83,7 @@ parallel — with a self-contained recipe and no vLLM build dependency for EP.
   `data_parallel_controller.py`). All save/load logic lives in the integration
   layer; the edits are inert unless `--foundry-graph-extension-config-path` is set.
 
-## Engine integrations
+### Engine integrations
 
 - **SGLang** — integration for SGLang v0.5.13. Working configurations: single
   GPU, data parallel (DP), expert parallel (EP, DeepEP low-latency + DP-attention with fa3). Self-contained recipes under `recipe/sglang/` (shared TOML pair +
@@ -45,7 +105,7 @@ parallel — with a self-contained recipe and no vLLM build dependency for EP.
   on LOAD, with `init_nvshmem_for_loaded_modules` run once on LOAD before any
   NVSHMEM-kernel graph replays.
 
-## Fixes
+### Fixes
 
 - **Per-rank VMM device binding (DP/TP/EP).** `set_allocation_region` binds to
   the current CUDA device, so the integration now calls `set_device(gpu_id)`
@@ -63,7 +123,7 @@ parallel — with a self-contained recipe and no vLLM build dependency for EP.
   capture loop never sets), and the FlashInfer per-bs pre-pass gated off for fa3
   while still populating `decode_cuda_graph_metadata` post-load for replay.
 
-## Docs
+### Docs
 
 - New `docs/sglang/` set (overview, direct-edits, hooks, memory-lifecycle,
   save-load-workflow, memory-consistency) and a self-contained `recipe/sglang/`
@@ -72,8 +132,6 @@ parallel — with a self-contained recipe and no vLLM build dependency for EP.
   DP, and EP as validated.
 
 ---
-
-## Previous Releases
 
 ## Foundry 0.0.1
 

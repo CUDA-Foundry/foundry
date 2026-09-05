@@ -73,25 +73,44 @@ Foundry ships engine integrations under `foundry/python/foundry/integration/`. P
 
 | Engine | Integration code | Documentation | Setup Instructions |
 |---|---|---|---|
-| SGLang | [`integration/sglang/`](python/foundry/integration/sglang/) | [`docs/sglang/overview.md`](docs/sglang/overview.md) | [`recipe/sglang/README.md`](recipe/sglang/README.md) |
 | vLLM | [`integration/vllm/`](python/foundry/integration/vllm/) | [`docs/vllm/overview.md`](docs/vllm/overview.md) | [`recipe/vllm/README.md`](recipe/vllm/README.md) |
+| SGLang | [`integration/sglang/`](python/foundry/integration/sglang/) | [`docs/sglang/overview.md`](docs/sglang/overview.md) | [`recipe/sglang/README.md`](recipe/sglang/README.md) |
 | TensorRT-LLM | [`integration/trtllm/`](python/foundry/integration/trtllm/) | [`docs/trtllm/overview.md`](docs/trtllm/overview.md) | [`recipe/trtllm/README.md`](recipe/trtllm/README.md) |
 
 ### Status
 
 | Engine | Single GPU | DP | TP | EP |
 |---|:---:|:---:|:---:|:---:|
-| SGLang | ✅ | ✅ | 🚧 | ✅ |
 | vLLM | ✅ | ✅ | 🚧 | ✅ |
+| SGLang | ✅ | ✅ | ✅ | ✅ |
 | TensorRT-LLM | 🚧 | 🚧 | 🚧 | 🚧 |
 
 ✅ validated end-to-end (SAVE → LOAD → query) &nbsp;·&nbsp; 🚧 not yet
+
+SGLang TP uses torch symmetric-memory allreduce inside the decode graphs (TP=2/4);
+SGLang EP covers DeepEP low-latency (NVSHMEM) and DeepEP v2 (NCCL symmetric
+windows). Every SGLang configuration is validated with the full decode-graph set
+(batch sizes 1..256) for restore time, per-token latency and greedy-output
+equality against unmodified SGLang; see [`recipe/sglang/README.md`](recipe/sglang/README.md#validation).
 
 The adapted vLLM / SGLang / TensorRT-LLM forks will be released alongside this repo at `foundry-org/vllm`, `foundry-org/sglang`, `foundry-org/TensorRT-LLM`.
 
 ### Performance
 
-🚧🚧🚧
+SGLang on 8×H100 (2 GPUs per run), all 256 decode graphs captured or restored,
+prefill graphs off on both sides, median TPOT of restored vs unmodified SGLang:
+
+| Config | Model | Capture | Restore | Init to `/health`: SGLang → foundry LOAD | TPOT delta (bs 1 / 8 / 32 / 128) |
+|---|---|---:|---:|---:|---|
+| TP=2 (symm-mem) | Qwen3-32B | 26.7 s | 3.5 s | 63 s → 41 s | -0.4 / -0.3 / +0.0 / -0.7 % |
+| EP=2 (DeepEP LL) | Qwen3-30B-A3B | 38.0 s | 2.5 s | 75 s → 45 s | -0.0 / -0.0 / +0.1 / +0.6 % |
+| EP=2 (DeepEP v2, NCCL) | Qwen3-30B-A3B-FP8 | 56 s | 2.1 s | 93 s → 45 s | +0.0 / +0.0 / +0.2 / +0.2 % |
+
+Restored graphs keep their programmatic-dependent-launch edges, so per-token
+latency matches the captured graphs within run-to-run noise
+([`docs/pdl-edge-batching.md`](docs/pdl-edge-batching.md)). Greedy completions
+are identical to unmodified SGLang for dense TP and within SGLang's own
+run-to-run nondeterminism for MoE.
 
 ## Roadmap
 
